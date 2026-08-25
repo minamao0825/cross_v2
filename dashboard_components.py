@@ -1,0 +1,1005 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import html
+import re
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable
+
+import pandas as pd
+import streamlit as st
+
+from services.solvency_financing_analysis import summarize_financing
+from services.solvency_navigation import KPMG_CATEGORIES
+from services.solvency_report_notes import (
+    NOTE_COLUMNS,
+    normalize_notes_frame,
+    notes_lookup,
+    notes_workbook_bytes,
+    overlay_notes,
+    read_notes_workbook,
+)
+from services.solvency_step6_analysis import sort_report_periods
+
+
+_PRINT_COMPONENT = st.components.v2.component(
+    "solvency_dashboard_print_control",
+    html="""
+<div id="print-dashboard-controls">
+  <button class="print-dashboard print-dashboard--portrait" data-mode="portrait" type="button">🖨️ 导出竖版 A4 PDF</button>
+  <button class="print-dashboard print-dashboard--widescreen" data-mode="widescreen" type="button">🖨️ 导出横版 16:9 PDF</button>
+</div>
+""",
+    css="""
+#print-dashboard-controls { display:flex; flex-direction:column; gap:8px; }
+.print-dashboard {
+  width: 100%;
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 6px;
+  color: #ffffff;
+  font: 600 14px/1.2 var(--st-font, sans-serif);
+  cursor: pointer;
+}
+.print-dashboard--portrait { background:#00338D; }
+.print-dashboard--widescreen { background:#098E7E; }
+.print-dashboard:hover { filter:brightness(1.08); }
+.print-dashboard:focus-visible {
+  outline: 2px solid var(--st-primary-color, #00338d);
+  outline-offset: 2px;
+}
+""",
+    js="""
+export default function (component) {
+  const { parentElement } = component
+  const buttons = parentElement.querySelectorAll(".print-dashboard")
+  const view = parentElement.ownerDocument?.defaultView ?? window
+  const doc = view.document
+  const root = doc.documentElement
+  const timers = new Set()
+  let disposed = false
+  let activeJob = null
+
+  const later = (callback, delay) => {
+    const timer = view.setTimeout(() => {
+      timers.delete(timer)
+      callback()
+    }, delay)
+    timers.add(timer)
+    return timer
+  }
+  const delay = (milliseconds) => new Promise((resolve) => later(resolve, milliseconds))
+  const resizeCharts = () => {
+    view.dispatchEvent(new view.Event("resize"))
+    void doc.body.offsetWidth
+  }
+  const removePrintMode = () => {
+    root.classList.remove(
+      "solvency-print-mode-portrait",
+      "solvency-print-mode-widescreen",
+    )
+    doc.getElementById("dynamic-solvency-print-style")?.remove()
+  }
+  const printContentRoot = () => (
+    doc.querySelector('[data-testid="stMain"]') ?? doc.body
+  )
+  const participatesInPrintLayout = (element) => {
+    const style = view.getComputedStyle(element)
+    return style.display !== "none"
+      && style.visibility !== "hidden"
+      && element.getClientRects().length > 0
+  }
+  const hasStaleElements = () => Array.from(
+    printContentRoot().querySelectorAll(
+      '[data-testid="stElementContainer"][data-stale="true"]'
+    )
+  ).some(participatesInPrintLayout)
+  const waitForStablePage = async (timeoutMilliseconds = 15000) => {
+    const startedAt = Date.now()
+    let consecutiveStableChecks = 0
+    while (!disposed && Date.now() - startedAt < timeoutMilliseconds) {
+      consecutiveStableChecks = hasStaleElements() ? 0 : consecutiveStableChecks + 1
+      if (consecutiveStableChecks >= 3) return true
+      await delay(120)
+    }
+    return false
+  }
+  const setButtonsBusy = (busy, activeButton = null) => {
+    buttons.forEach((button) => {
+      button.dataset.defaultLabel ||= button.textContent
+      button.disabled = busy
+      button.style.cursor = busy ? "wait" : "pointer"
+      button.textContent = busy && button === activeButton
+        ? "正在等待页面更新完成…"
+        : button.dataset.defaultLabel
+    })
+  }
+  const finishJob = (job) => {
+    if (activeJob !== job) return
+    removePrintMode()
+    view.removeEventListener("afterprint", job.afterPrint)
+    if (view.__solvencyDashboardPrintJob === job) {
+      delete view.__solvencyDashboardPrintJob
+    }
+    activeJob = null
+    setButtonsBusy(false)
+    view.requestAnimationFrame(resizeCharts)
+  }
+
+  buttons.forEach((button) => button.onclick = async () => {
+    if (disposed || view.__solvencyDashboardPrintJob) return
+    const job = { afterPrint: null }
+    job.afterPrint = () => finishJob(job)
+    activeJob = job
+    view.__solvencyDashboardPrintJob = job
+    setButtonsBusy(true, button)
+
+    // Only visible stale elements inside the current main report can block
+    // printing. Hidden workflow tabs, collapsed content and obsolete modules
+    // do not participate in the print layout and must not keep this waiting.
+    // Three stable checks protect against opening the dialog mid-render.
+    const stableBeforeLayout = await waitForStablePage()
+    if (!stableBeforeLayout || disposed || activeJob !== job) {
+      finishJob(job)
+      if (!disposed) {
+        button.textContent = "页面仍在更新，请稍后重试"
+        later(() => {
+          if (!disposed) button.textContent = button.dataset.defaultLabel
+        }, 1800)
+      }
+      return
+    }
+
+    const mode = button.dataset.mode === "portrait" ? "portrait" : "widescreen"
+    removePrintMode()
+    root.classList.add(`solvency-print-mode-${mode}`)
+    const style = doc.createElement("style")
+    style.id = "dynamic-solvency-print-style"
+    style.textContent = mode === "portrait"
+      ? "@page { size: A4 portrait; margin: 10mm; }"
+      : "@page { size: 338.67mm 190.5mm; margin: 0; }"
+    // Streamlit injects page-level styles inside the document body. Appending
+    // here makes the selected paper rule the last rule in cascade order.
+    doc.body.appendChild(style)
+    view.addEventListener("afterprint", job.afterPrint, { once: true })
+    // Give Streamlit/Vega two completed layouts at the final paper width.
+    // This keeps bar widths and text native to each narrow company panel
+    // instead of printing the wider screen canvas across adjacent panels.
+    await new Promise((resolve) => view.requestAnimationFrame(resolve))
+    resizeCharts()
+    await new Promise((resolve) => view.requestAnimationFrame(resolve))
+    resizeCharts()
+    await delay(360)
+
+    // A rerun may begin while the print-width layout is settling. Never open
+    // the print dialog with Streamlit's stale transition still in the DOM.
+    if (disposed || activeJob !== job || hasStaleElements()) {
+      finishJob(job)
+      return
+    }
+    resizeCharts()
+    try {
+      view.print()
+    } finally {
+      // window.print() normally returns after the dialog closes. This fallback
+      // also cleans up browsers that omit the afterprint event.
+      later(() => finishJob(job), 0)
+    }
+  })
+
+  return () => {
+    disposed = true
+    buttons.forEach((button) => { button.onclick = null })
+    if (activeJob) finishJob(activeJob)
+    timers.forEach((timer) => view.clearTimeout(timer))
+    timers.clear()
+  }
+}
+""",
+)
+
+
+@dataclass(frozen=True)
+class IndustryOverview:
+    report_period: str
+    period_scope: str
+    company_count: int
+    combined_median: float | None
+    core_median: float | None
+    sufficient_count: int
+    warning_count: int
+    insufficient_count: int
+
+
+def _text_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series("", index=frame.index, dtype="string")
+    return frame[column].fillna("").astype(str).str.strip()
+
+
+def company_detail_rows(frame: pd.DataFrame | None) -> pd.DataFrame:
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return pd.DataFrame()
+    result = frame.copy()
+    company = _text_series(result, "公司")
+    company_type = _text_series(result, "公司类型")
+    company_code = _text_series(result, "公司统一编码")
+    industry = (
+        company.eq("行业合计")
+        | company_type.eq("行业合计")
+        | company_code.str.startswith("INDUSTRY_")
+    )
+    return result.loc[~industry & company.ne("")].copy()
+
+
+def preferred_period_scope(frame: pd.DataFrame, requested: str = "") -> str:
+    scopes = _text_series(frame, "期间口径")
+    available = [value for value in scopes.unique().tolist() if value]
+    if requested and requested in available:
+        return requested
+    for preferred in ("本季度末数", "期末数", "本年累计数", "本季度数"):
+        if preferred in available:
+            return preferred
+    return available[0] if available else ""
+
+
+def profile_platform_copy(
+    profile_id: str,
+    profile_name: str,
+    frequency: str,
+) -> tuple[str, str]:
+    profile_text = f"{profile_id} {profile_name}".lower()
+    if "non_life" in profile_text or "财产" in profile_text or "财险" in profile_text:
+        sector = "财产险公司"
+    elif "life" in profile_text or "寿险" in profile_text or "人身" in profile_text:
+        sector = "人身险公司"
+    else:
+        clean_name = str(profile_name or "保险公司").replace("季度报告", "").replace("年度报告", "").strip()
+        sector = clean_name or "保险公司"
+
+    annual = str(frequency or "").upper() == "ANNUAL" or "年报" in profile_text or "年度报告" in profile_text
+    if annual:
+        report_label = "年度报告"
+        database_label = "年度报告数据库"
+    else:
+        report_label = "偿付能力"
+        database_label = "偿付能力季度报告数据库"
+    return (
+        f"{sector}{report_label}信息分享",
+        f"中国{sector}{database_label}",
+    )
+
+
+def format_period_label(periods: Iterable[object]) -> str:
+    ordered = sort_report_periods(periods)
+    if not ordered:
+        return "-"
+    if len(ordered) == 1:
+        return ordered[0]
+    if len(ordered) <= 3:
+        return "、".join(ordered)
+    return f"{ordered[0]}–{ordered[-1]}"
+
+
+def format_target_label(targets: Iterable[object] | str) -> str:
+    if isinstance(targets, str):
+        return targets.strip() or "全部公司"
+    values = [str(value).strip() for value in targets if str(value).strip()]
+    if not values:
+        return "全部公司"
+    if len(values) <= 3:
+        return "、".join(values)
+    return f"{len(values)} 家公司"
+
+
+@lru_cache(maxsize=8)
+def _image_data_uri(path_value: str) -> str:
+    path = Path(path_value)
+    if not path.exists():
+        return ""
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def build_dashboard_header_html(
+    *,
+    title: str,
+    database_name: str,
+    report_period: str,
+    period_scope: str,
+    company_count: int,
+    target: str,
+    image_path: str | Path,
+) -> str:
+    image_uri = _image_data_uri(str(Path(image_path).resolve()))
+    background = (
+        f"url('{image_uri}')"
+        if image_uri
+        else "linear-gradient(90deg, #1525ff 0%, #1525ff 67%, #071b69 67%, #071b69 100%)"
+    )
+    safe_title = html.escape(str(title))
+    details = (
+        f"{database_name}　·　报告期：{report_period or '-'}　·　"
+        f"口径：{period_scope or '-'}　·　{int(company_count):,} 家公司　·　"
+        f"目标：{target or '全部公司'}"
+    )
+    safe_details = html.escape(details)
+    return f"""
+    <style>
+      .solvency-dashboard-hero {{
+        min-height: 178px;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        padding: 32px 34px;
+        margin: 0 0 18px 0;
+        border-radius: 8px;
+        background-image: {background};
+        background-size: 100% auto;
+        background-position: center top;
+        background-repeat: no-repeat;
+        color: #ffffff;
+      }}
+      .solvency-dashboard-hero__content {{
+        width: 72%;
+      }}
+      .solvency-dashboard-hero__title {{
+        margin: 0 0 16px 0;
+        color: #ffffff !important;
+        font-size: clamp(25px, 2.6vw, 40px);
+        line-height: 1.2;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }}
+      .solvency-dashboard-hero__details {{
+        margin: 0;
+        color: #ffffff !important;
+        font-size: clamp(12px, 1.15vw, 16px);
+        line-height: 1.6;
+        font-weight: 500;
+      }}
+      @media (max-width: 760px) {{
+        .solvency-dashboard-hero {{ min-height: 150px; padding: 24px; }}
+        .solvency-dashboard-hero__content {{ width: 78%; }}
+      }}
+    </style>
+    <section class="solvency-dashboard-hero" aria-label="{safe_title}">
+      <div class="solvency-dashboard-hero__content">
+        <div
+          class="solvency-dashboard-hero__title"
+          role="heading"
+          aria-level="1"
+          style="color: #ffffff !important;"
+        >{safe_title}</div>
+        <p class="solvency-dashboard-hero__details" style="color: #ffffff !important;">{safe_details}</p>
+      </div>
+    </section>
+    """
+
+
+def build_report_cover_html(
+    *,
+    title: str,
+    subtitle: str,
+    date_text: str,
+    image_path: str | Path,
+) -> str:
+    image_uri = _image_data_uri(str(Path(image_path).resolve()))
+    background = (
+        f'<img src="{image_uri}" alt="" />'
+        if image_uri
+        else '<div class="solvency-cover-fallback"></div>'
+    )
+    return f"""
+    <div class="solvency-print-cover solvency-print-cover--front">
+      {background}
+      <div class="solvency-print-cover__text">
+        <div class="solvency-print-cover__title">{html.escape(str(title))}</div>
+        <div class="solvency-print-cover__subtitle">{html.escape(str(subtitle))}</div>
+        <div class="solvency-print-cover__date">{html.escape(str(date_text))}</div>
+      </div>
+    </div>
+    """
+
+
+def build_report_back_cover_html(image_path: str | Path) -> str:
+    image_uri = _image_data_uri(str(Path(image_path).resolve()))
+    background = (
+        f'<img src="{image_uri}" alt="" />'
+        if image_uri
+        else '<div class="solvency-cover-fallback"></div>'
+    )
+    return f"""
+    <div class="solvency-print-cover solvency-print-cover--back">
+      {background}
+    </div>
+    """
+
+
+def render_report_cover(
+    *,
+    title: str,
+    subtitle: str,
+    date_text: str,
+    picture_dir: str | Path,
+) -> None:
+    st.markdown(
+        build_report_cover_html(
+            title=title,
+            subtitle=subtitle,
+            date_text=date_text,
+            image_path=Path(picture_dir) / "标题页.png",
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_report_back_cover(*, picture_dir: str | Path) -> None:
+    st.markdown(
+        build_report_back_cover_html(Path(picture_dir) / "封底页.png"),
+        unsafe_allow_html=True,
+    )
+
+
+def render_report_notes_editor(
+    *,
+    title: str,
+    key_prefix: str,
+    template: pd.DataFrame,
+) -> dict[str, dict[str, str]]:
+    """Render the annual-platform notes workflow with an offline template."""
+    source_key = f"{key_prefix}_notes_source"
+    digest_key = f"{key_prefix}_notes_upload_digest"
+    editor_key = f"{key_prefix}_notes_editor"
+    if source_key not in st.session_state:
+        st.session_state[source_key] = normalize_notes_frame(template)
+
+    notes_expander = st.expander(
+        title,
+        expanded=False,
+        icon=":material/edit_note:",
+        key=f"{key_prefix}_notes_expander",
+        on_change="rerun",
+    )
+    source = st.session_state[source_key]
+    if not notes_expander.open:
+        return notes_lookup(source.reindex(columns=NOTE_COLUMNS))
+
+    with notes_expander:
+        st.caption(
+            "先下载模板填写，也可上传后直接在页面中修改分析内容和注释；"
+            "一级、二级模块及图表对应关系保持锁定。"
+        )
+        st.download_button(
+            "下载分析注释模板",
+            data=notes_workbook_bytes(template),
+            file_name=f"{key_prefix}_图片内容分析和注释模板.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            icon=":material/download:",
+            key=f"{key_prefix}_notes_template_download",
+        )
+        upload = st.file_uploader(
+            "上传分析注释表 Excel",
+            type=["xlsx"],
+            key=f"{key_prefix}_notes_upload",
+        )
+        if upload is not None:
+            payload = upload.getvalue()
+            digest = hashlib.sha256(payload).hexdigest()
+            if st.session_state.get(digest_key) != digest:
+                try:
+                    uploaded = read_notes_workbook(payload, upload.name)
+                    st.session_state[source_key] = overlay_notes(template, uploaded)
+                    st.session_state[digest_key] = digest
+                    st.session_state.pop(editor_key, None)
+                    st.success(f"已读取 {len(uploaded):,} 条分析注释配置。")
+                except Exception as exc:
+                    st.error(f"分析注释表读取失败：{exc}")
+
+        source = st.session_state[source_key]
+        edited = st.data_editor(
+            source,
+            key=editor_key,
+            width="stretch",
+            hide_index=True,
+            num_rows="fixed",
+            disabled=["模块ID", "一级分类", "二级分类", "对应图表名称"],
+            column_config={
+                "模块ID": st.column_config.TextColumn(width="small"),
+                "一级分类": st.column_config.TextColumn(width="medium"),
+                "二级分类": st.column_config.TextColumn(width="medium"),
+                "对应图表名称": st.column_config.TextColumn(width="large", pinned=True),
+                "分析内容-默认": st.column_config.TextColumn(width="large"),
+                "分析内容-自定义": st.column_config.TextColumn(width="large"),
+                "注释内容": st.column_config.TextColumn(width="large"),
+                "图片文件名": st.column_config.TextColumn(width="medium"),
+            },
+        )
+        st.session_state[source_key] = normalize_notes_frame(edited)
+    return notes_lookup(edited.reindex(columns=NOTE_COLUMNS))
+
+
+def render_report_analysis(note: dict[str, str] | None) -> None:
+    note = note or {}
+    default_text = str(note.get("分析内容-默认", "") or "").strip()
+    custom_text = str(note.get("分析内容-自定义", "") or "").strip()
+    if not default_text and not custom_text:
+        return
+    paragraphs = []
+    if default_text:
+        paragraphs.append(
+            f'<p class="solvency-note-default">{html.escape(default_text)}</p>'
+        )
+    if custom_text:
+        paragraphs.append(
+            f'<p class="solvency-note-custom">{html.escape(custom_text)}</p>'
+        )
+    st.markdown(
+        '<div class="solvency-report-analysis">' + "".join(paragraphs) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_report_footnote(note: dict[str, str] | None) -> None:
+    text = str((note or {}).get("注释内容", "") or "").strip()
+    if text:
+        st.markdown(
+            f'<p class="solvency-report-footnote">注：{html.escape(text)}</p>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_dashboard_header(
+    placeholder,
+    data: pd.DataFrame | None,
+    *,
+    profile_id: str,
+    profile_name: str,
+    frequency: str,
+    image_path: str | Path,
+    periods: Iterable[object] = (),
+    period_scope: str = "",
+    targets: Iterable[object] | str = (),
+) -> None:
+    title, database_name = profile_platform_copy(profile_id, profile_name, frequency)
+    detail = company_detail_rows(data)
+    company_count = int(_text_series(detail, "公司").nunique()) if not detail.empty else 0
+    available_periods = periods or _text_series(detail, "报告期").tolist()
+    report_period = format_period_label(available_periods)
+    if not period_scope and not detail.empty:
+        selected_period = sort_report_periods(_text_series(detail, "报告期").tolist())
+        period_frame = detail[
+            _text_series(detail, "报告期").eq(selected_period[-1])
+        ] if selected_period else detail
+        period_scope = preferred_period_scope(period_frame)
+    header_html = build_dashboard_header_html(
+        title=title,
+        database_name=database_name,
+        report_period=report_period,
+        period_scope=period_scope,
+        company_count=company_count,
+        target=format_target_label(targets),
+        image_path=image_path,
+    )
+    placeholder.html(header_html, width="stretch")
+
+
+def calculate_industry_overview(
+    data: pd.DataFrame | None,
+    *,
+    report_period: str = "",
+    period_scope: str = "",
+) -> IndustryOverview:
+    detail = company_detail_rows(data)
+    if detail.empty:
+        return IndustryOverview("", "", 0, None, None, 0, 0, 0)
+    periods = sort_report_periods(_text_series(detail, "报告期").tolist())
+    selected_period = report_period if report_period in periods else (periods[-1] if periods else "")
+    period_frame = detail[_text_series(detail, "报告期").eq(selected_period)].copy()
+    selected_scope = preferred_period_scope(period_frame, period_scope)
+    if selected_scope:
+        period_frame = period_frame[
+            _text_series(period_frame, "期间口径").eq(selected_scope)
+        ].copy()
+    period_frame["数值_numeric"] = pd.to_numeric(period_frame.get("数值"), errors="coerce")
+
+    def metric_values(code: str) -> pd.Series:
+        rows = period_frame[
+            _text_series(period_frame, "指标编码").eq(code)
+        ].dropna(subset=["数值_numeric"])
+        rows = rows.drop_duplicates(subset=["公司"], keep="last")
+        return rows.set_index("公司")["数值_numeric"]
+
+    combined = metric_values("COMBINED_SOLVENCY_RATIO")
+    core = metric_values("CORE_SOLVENCY_RATIO")
+    company_count = int(combined.index.nunique())
+    if company_count == 0:
+        company_count = int(_text_series(period_frame, "公司").nunique())
+    combined_median = float(combined.median()) if not combined.empty else None
+    core_median = float(core.median()) if not core.empty else None
+    return IndustryOverview(
+        report_period=selected_period,
+        period_scope=selected_scope,
+        company_count=company_count,
+        combined_median=combined_median,
+        core_median=core_median,
+        sufficient_count=int((combined >= 150).sum()),
+        warning_count=int(((combined >= 100) & (combined < 150)).sum()),
+        insufficient_count=int((combined < 100).sum()),
+    )
+
+
+def build_key_solvency_overview_table(
+    data: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, str, str]:
+    """Return the Excel-guide comparison using the prior-year matching period."""
+    detail = company_detail_rows(data)
+    periods = sort_report_periods(_text_series(detail, "报告期").tolist())
+    latest_period = periods[-1] if periods else ""
+    latest_match = re.match(r"^(20\d{2})(.*)$", latest_period)
+    prior_period = ""
+    if latest_match:
+        prior_candidate = f"{int(latest_match.group(1)) - 1}{latest_match.group(2)}"
+        if prior_candidate in periods:
+            prior_period = prior_candidate
+    latest_label = latest_period or "本期"
+    prior_label = prior_period or "上年同期"
+    comparison_label = f"{latest_label}-{prior_label}"
+    columns = [
+        "公司名称",
+        f"核心资本充足率%变化 {comparison_label}",
+        f"综合资本充足率%变化 {comparison_label}",
+        f"实际资本%变化 {comparison_label}",
+        f"最低资本%变化 {comparison_label}",
+        f"未来保单盈余%变化 {comparison_label}",
+        "保单未来盈余/核心资本比例",
+        "市场风险占比",
+        "保险风险占比",
+        f"认可负债余额%变化 {comparison_label}",
+    ]
+    if detail.empty or not latest_period:
+        return pd.DataFrame(columns=columns), latest_period, prior_period
+
+    scope_priority = {
+        "期末数": 0,
+        "本季度末数": 1,
+        "本季度数": 2,
+        "": 3,
+        "上季度末数": 4,
+        "期初数": 5,
+    }
+    selected = detail[
+        _text_series(detail, "报告期").isin([period for period in (prior_period, latest_period) if period])
+    ].copy()
+    selected["_scope_rank"] = _text_series(selected, "期间口径").map(
+        lambda value: scope_priority.get(value, 3)
+    )
+    selected["数值"] = pd.to_numeric(selected.get("数值"), errors="coerce")
+    selected = selected.sort_values("_scope_rank").drop_duplicates(
+        ["公司", "报告期", "指标编码"],
+        keep="first",
+    )
+    pivot = selected.pivot_table(
+        index=["公司", "报告期"],
+        columns="指标编码",
+        values="数值",
+        aggfunc="first",
+    )
+
+    policy_codes = (
+        "POLICY_SURPLUS_CORE_T1",
+        "POLICY_SURPLUS_CORE_T2",
+        "POLICY_SURPLUS_ANC_T1",
+        "POLICY_SURPLUS_ANC_T2",
+    )
+
+    def value(company: str, period: str, code: str) -> float | None:
+        if not period or (company, period) not in pivot.index or code not in pivot.columns:
+            return None
+        raw = pivot.loc[(company, period), code]
+        return None if pd.isna(raw) else float(raw)
+
+    def total(company: str, period: str, codes: Iterable[str]) -> float | None:
+        values = [value(company, period, code) for code in codes]
+        return None if any(item is None for item in values) else float(sum(values))
+
+    def change(current: float | None, previous: float | None) -> float | None:
+        if current is None or previous in {None, 0}:
+            return None
+        return current / previous - 1
+
+    def difference(current: float | None, previous: float | None) -> float | None:
+        return None if current is None or previous is None else current - previous
+
+    companies = list(dict.fromkeys(_text_series(detail, "公司")))
+    rows: list[dict[str, object]] = []
+    for company in companies:
+        latest_policy = total(company, latest_period, policy_codes)
+        prior_policy = total(company, prior_period, policy_codes)
+        core_ratio = value(company, latest_period, "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL")
+        if core_ratio is None:
+            core_policy = total(
+                company,
+                latest_period,
+                ("POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2"),
+            )
+            core_capital = total(
+                company,
+                latest_period,
+                ("CORE_T1_CAPITAL", "CORE_T2_CAPITAL"),
+            )
+            core_ratio = (
+                None
+                if core_policy is None or core_capital in {None, 0}
+                else core_policy / core_capital
+            )
+        rows.append({
+            "公司名称": company,
+            columns[1]: difference(
+                value(company, latest_period, "CORE_SOLVENCY_RATIO"),
+                value(company, prior_period, "CORE_SOLVENCY_RATIO"),
+            ),
+            columns[2]: difference(
+                value(company, latest_period, "COMBINED_SOLVENCY_RATIO"),
+                value(company, prior_period, "COMBINED_SOLVENCY_RATIO"),
+            ),
+            columns[3]: change(
+                value(company, latest_period, "ACTUAL_CAPITAL"),
+                value(company, prior_period, "ACTUAL_CAPITAL"),
+            ),
+            columns[4]: change(
+                value(company, latest_period, "MINIMUM_CAPITAL"),
+                value(company, prior_period, "MINIMUM_CAPITAL"),
+            ),
+            columns[5]: change(latest_policy, prior_policy),
+            columns[6]: core_ratio,
+            columns[7]: value(company, latest_period, "MARKET_RISK_TO_QUANT_CAPITAL"),
+            columns[8]: value(company, latest_period, "LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL"),
+            columns[9]: change(
+                value(company, latest_period, "RECOGNIZED_LIABILITIES"),
+                value(company, prior_period, "RECOGNIZED_LIABILITIES"),
+            ),
+        })
+    return pd.DataFrame(rows, columns=columns), latest_period, prior_period
+
+
+def build_key_solvency_overview_html(
+    display: pd.DataFrame,
+    highlight_company: str = "无",
+) -> str:
+    """Render the overview with the annual-report platform's exact table styling."""
+    parts = [
+        "<div style='width:100%;overflow:visible;'>",
+        "<table class='key-solvency-overview' style='width:100%;border-collapse:collapse;"
+        "font-family:sans-serif;font-size:11px;margin-bottom:15px;'>",
+        "<thead><tr style='background-color:#00338D;color:white;text-align:center;font-weight:bold;'>",
+    ]
+    for index, column in enumerate(display.columns):
+        header = html.escape(str(column))
+        if index:
+            header = header.replace("变化% ", "变化%<br>", 1)
+            header = header.replace("变化 ", "变化<br>", 1)
+        alignment = "left" if index == 0 else "center"
+        nowrap = "white-space:nowrap;" if index == 0 else "white-space:normal;line-height:1.25;"
+        parts.append(
+            f"<th style='padding:6px 4px;text-align:{alignment};border:1.5px solid white;"
+            f"font-size:11px;font-weight:bold;{nowrap}'>{header}</th>"
+        )
+    parts.append("</tr></thead><tbody>")
+    tracked_company = str(highlight_company or "").strip()
+    for row_position, (_, row) in enumerate(display.iterrows()):
+        company = str(row.iloc[0]).strip() if len(row) else ""
+        is_highlight = (
+            tracked_company not in {"", "无"} and company == tracked_company
+        )
+        row_background = (
+            "rgba(0,51,141,0.03)"
+            if is_highlight
+            else "white" if row_position % 2 == 0 else "#F8F9FA"
+        )
+        parts.append("<tr>")
+        for column_index, value in enumerate(row.tolist()):
+            text = html.escape(str(value))
+            is_missing = text == "未披露"
+            background = "#CDCDCD" if is_missing else row_background
+            color = (
+                "white"
+                if is_missing
+                else "#00338D" if is_highlight and column_index else "#333333" if column_index == 0 else "#444444"
+            )
+            alignment = "left" if column_index == 0 else "center"
+            nowrap = (
+                "white-space:nowrap;word-break:keep-all;overflow-wrap:normal;"
+                if column_index == 0
+                else "white-space:normal;line-height:1.25;"
+            )
+            if is_highlight:
+                border = "border-top:1.5px solid #00338D;border-bottom:1.5px solid #00338D;"
+                if column_index == 0:
+                    border += "border-left:1.5px solid #00338D;"
+                if column_index == len(row) - 1:
+                    border += "border-right:1.5px solid #00338D;"
+                weight = "font-weight:bold;"
+            else:
+                border = "border:1px solid #EAEAEA;"
+                weight = ""
+            parts.append(
+                f"<td style='background-color:{background};padding:4px;font-size:11px;"
+                f"{border}{weight}text-align:{alignment};color:{color};{nowrap}'>{text}</td>"
+            )
+        parts.append("</tr>")
+    parts.append("</tbody></table></div>")
+    return "".join(parts)
+
+
+def _format_key_solvency_overview_display(table: pd.DataFrame) -> pd.DataFrame:
+    """Format the comparison table while preserving its underlying numeric values."""
+    display = table.copy()
+    for column in display.columns[1:3]:
+        display[column] = display[column].map(
+            lambda value: "未披露" if pd.isna(value) else f"{float(value):.1f}%"
+        )
+    for column in display.columns[3:]:
+        display[column] = display[column].map(
+            lambda value: "未披露" if pd.isna(value) else f"{float(value):.1%}"
+        )
+    return display
+
+
+def render_key_solvency_overview(
+    data: pd.DataFrame | None,
+    *,
+    highlight_company: str = "无",
+) -> pd.DataFrame:
+    table, latest_period, prior_period = build_key_solvency_overview_table(data)
+    st.markdown("### :material/table_chart: 关键偿付数据概览")
+    if table.empty:
+        st.info("当前数据没有可生成关键偿付数据概览的公司记录。")
+        return table
+    if not prior_period:
+        st.warning("当前缺少本期对应的上年同期报告期；所有同期变化列暂时留空。")
+    display = _format_key_solvency_overview_display(table)
+    st.markdown(
+        build_key_solvency_overview_html(display, highlight_company),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        f"比较期间：{prior_period or '缺少上期'} → {latest_period or '缺少本期'}；"
+        "灰色“未披露”表示原始披露或派生指标不足，未以 0 替代。"
+    )
+    return table
+
+
+def render_industry_overview(data: pd.DataFrame | None) -> IndustryOverview:
+    overview = calculate_industry_overview(data)
+    st.markdown(
+        f"### :material/account_balance: 01 · 行业整体偿付能力概览 · "
+        f"{overview.report_period or '-'}"
+    )
+    first_row = st.columns(3)
+    first_row[0].metric("纳入公司数", f"{overview.company_count:,} 家", border=True)
+    first_row[1].metric(
+        "综合偿付能力充足率中位数",
+        "-" if overview.combined_median is None else f"{overview.combined_median:.1f}%",
+        border=True,
+    )
+    first_row[2].metric(
+        "核心偿付能力充足率中位数",
+        "-" if overview.core_median is None else f"{overview.core_median:.1f}%",
+        border=True,
+    )
+    denominator = max(overview.company_count, 1)
+    second_row = st.columns(3)
+    second_row[0].metric(
+        "充足（≥150%）",
+        f"{overview.sufficient_count:,} 家",
+        f"占比 {overview.sufficient_count / denominator:.0%}",
+        delta_color="green",
+        delta_arrow="off",
+        border=True,
+    )
+    second_row[1].metric(
+        "预警（100%–150%）",
+        f"{overview.warning_count:,} 家",
+        f"占比 {overview.warning_count / denominator:.0%}",
+        delta_color="gray",
+        delta_arrow="off",
+        border=True,
+    )
+    second_row[2].metric(
+        "不达标（<100%）",
+        f"{overview.insufficient_count:,} 家",
+        f"占比 {overview.insufficient_count / denominator:.0%}",
+        delta_color="red",
+        delta_arrow="off",
+        border=True,
+    )
+    if overview.period_scope:
+        st.caption(f"概览采用“{overview.period_scope}”口径；分档依据综合偿付能力充足率。")
+    return overview
+
+
+def render_major_financing(
+    data: pd.DataFrame | None,
+    *,
+    print_mode: bool = False,
+) -> None:
+    summary = summarize_financing(data)
+    st.markdown("### :material/assignment: 重大融资信息统计")
+    st.info(
+        "本页统计各公司在各季度的增资或发债事项，以及综合偿付能力充足率的变动情况。"
+    )
+    metrics = st.columns(3)
+    metrics[0].metric("融资事件总数", f"{summary.event_count:,}", border=True)
+    metrics[1].metric("涉及公司数", f"{summary.company_count:,}", border=True)
+    metrics[2].metric("最新季度", summary.latest_period or "-", border=True)
+
+    st.divider()
+    st.markdown("#### :material/bar_chart: 重大融资信息明细")
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        st.info("请在左侧边栏上传重大融资信息 Excel。")
+        return
+
+    periods = list(reversed(sort_report_periods(data["季度"].tolist())))
+    def render_period_table(period: str, period_frame: pd.DataFrame) -> None:
+        display = period_frame[
+            ["公司名称", "增资/发债", "季度总变动", "增资/发债的影响"]
+        ].reset_index(drop=True)
+        st.dataframe(
+            display,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "公司名称": st.column_config.TextColumn("公司名称", pinned=True, width="small"),
+                "增资/发债": st.column_config.TextColumn("增资/发债", width="large"),
+                "季度总变动": st.column_config.TextColumn("季度总变动", width="medium"),
+                "增资/发债的影响": st.column_config.TextColumn("增资/发债的影响", width="medium"),
+            },
+        )
+
+    for period in periods:
+        period_frame = data[data["季度"] == period].copy()
+        company_count = int(period_frame["公司名称"].nunique())
+        label = f"{period}（{company_count} 家公司）"
+        if print_mode:
+            st.markdown(f"#### {label}")
+            render_period_table(period, period_frame)
+        else:
+            with st.expander(
+                f":material/calendar_month: {label}",
+                expanded=period == summary.latest_period,
+            ):
+                render_period_table(period, period_frame)
+
+
+def render_print_control(*, key: str = "solvency_dashboard_print") -> None:
+    st.markdown("### :material/print: 打印/导出 PDF")
+    st.info(
+        "竖版 A4 与横版 16:9 均导出封面、正文和封底。"
+        "打印时请勾选“背景图形”以保留颜色。"
+    )
+    _PRINT_COMPONENT(key=key, width="stretch", height=96)
+
+
+def render_kpmg_palette() -> None:
+    with st.expander("查看 KPMG 官方色卡", icon=":material/palette:"):
+        for category, colors in KPMG_CATEGORIES.items():
+            st.markdown(f"**{category}**")
+            swatches = "".join(
+                (
+                    '<span style="display:inline-flex;align-items:center;gap:4px;'
+                    'margin:0 14px 8px 0;font-size:13px;">'
+                    f'<span style="width:14px;height:14px;border-radius:3px;'
+                    f'border:1px solid #d7dce5;background:{html.escape(color)};"></span>'
+                    f'{html.escape(name)} <b>({html.escape(color)})</b></span>'
+                )
+                for name, color in colors.items()
+            )
+            st.html(f'<div style="display:flex;flex-wrap:wrap;">{swatches}</div>')
