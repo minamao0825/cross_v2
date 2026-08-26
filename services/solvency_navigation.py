@@ -12,9 +12,9 @@ COMPANY_OVERVIEW_LEVEL = "关键偿付数据概览"
 ACTUAL_CAPITAL_LEVEL = "实际资本数据对比"
 MINIMUM_CAPITAL_LEVEL = "最低资本数据对比"
 APPENDIX_LEVEL = "附录"
-MARKET_RISK_ASSET_SCATTER = "利率与权益价格风险占认可资产率散点图"
-CREDIT_RISK_ASSET_SCATTER = "利差与对手违约风险占认可资产率散点图"
-INSURANCE_RISK_LIABILITY_SCATTER = "寿险与非寿险保险风险占认可负债率散点图"
+MARKET_RISK_ASSET_SCATTER = "利率与权益价格风险占认可资产率气泡图"
+CREDIT_RISK_ASSET_SCATTER = "利差与对手违约风险占认可资产率气泡图"
+INSURANCE_RISK_LIABILITY_SCATTER = "寿险与非寿险保险风险占认可负债率气泡图"
 
 KPMG_CATEGORIES = {
     "Primary Colors": {
@@ -206,10 +206,13 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
         COMPANY_OVERVIEW_LEVEL,
         "资本充足率",
         "资本使用效率与核心资本占比气泡图",
-        ("ACTUAL_CAPITAL", "RECOGNIZED_ASSETS", "CORE_T1_CAPITAL", "CORE_T2_CAPITAL"),
+        (
+            "ACTUAL_CAPITAL", "RECOGNIZED_ASSETS", "REGISTERED_CAPITAL",
+            "CORE_T1_CAPITAL", "CORE_T2_CAPITAL",
+        ),
         True,
     ),
-    NavigationEntry(COMPANY_OVERVIEW_LEVEL, "资本使用效率", "注册资本/核心资本率", ("REGISTERED_CAPITAL_TO_CORE_CAPITAL",)),
+    NavigationEntry(COMPANY_OVERVIEW_LEVEL, "资本使用效率", "核心资本/注册资本", ("CORE_CAPITAL_TO_REGISTERED_CAPITAL",)),
     NavigationEntry(COMPANY_OVERVIEW_LEVEL, "资本使用效率", "实际资本/认可资产率", ("ACTUAL_CAPITAL_TO_RECOGNIZED_ASSETS",)),
     NavigationEntry(ACTUAL_CAPITAL_LEVEL, "行业资本分级", "资本规模与结构", ("CORE_T1_CAPITAL", "CORE_T2_CAPITAL", "ANC_T1_CAPITAL", "ANC_T2_CAPITAL"), True),
     NavigationEntry(ACTUAL_CAPITAL_LEVEL, "核心资本", "核心资本明细占比-待定", (), always_available=True),
@@ -251,6 +254,7 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
         (
             "LIFE_INSURANCE_RISK_TO_LIABILITIES",
             "NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",
+            "RECOGNIZED_LIABILITIES",
         ),
         True,
     ),
@@ -270,7 +274,10 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
         MINIMUM_CAPITAL_LEVEL,
         "市场风险",
         MARKET_RISK_ASSET_SCATTER,
-        ("INTEREST_RATE_RISK_TO_ASSETS", "EQUITY_RISK_TO_ASSETS"),
+        (
+            "INTEREST_RATE_RISK_TO_ASSETS", "EQUITY_RISK_TO_ASSETS",
+            "RECOGNIZED_ASSETS",
+        ),
         True,
     ),
     NavigationEntry(
@@ -287,7 +294,10 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
         MINIMUM_CAPITAL_LEVEL,
         "信用风险",
         CREDIT_RISK_ASSET_SCATTER,
-        ("SPREAD_RISK_TO_ASSETS", "COUNTERPARTY_RISK_TO_ASSETS"),
+        (
+            "SPREAD_RISK_TO_ASSETS", "COUNTERPARTY_RISK_TO_ASSETS",
+            "RECOGNIZED_ASSETS",
+        ),
         True,
     ),
     NavigationEntry(MINIMUM_CAPITAL_LEVEL, "利率风险最低资本占认可资产率", "利率风险/认可资产率", ("INTEREST_RATE_RISK_TO_ASSETS",)),

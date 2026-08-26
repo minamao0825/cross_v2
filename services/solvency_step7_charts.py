@@ -1676,7 +1676,7 @@ def build_capital_efficiency_bubble_chart(
     linked_selection_name: str = "",
     zoom_domain_override: Mapping[str, Iterable[float]] | None = None,
 ) -> tuple[alt.Chart, str]:
-    """Plot latest-period capital efficiency, core share, and actual capital."""
+    """Plot latest-period capital efficiency, core/registered capital, and assets."""
     periods = list(dict.fromkeys(str(period) for period in period_order))
     if not periods:
         raise ValueError("缺少可绘制的报告期。")
@@ -1684,6 +1684,7 @@ def build_capital_efficiency_bubble_chart(
     required_codes = (
         "ACTUAL_CAPITAL",
         "RECOGNIZED_ASSETS",
+        "REGISTERED_CAPITAL",
         "CORE_T1_CAPITAL",
         "CORE_T2_CAPITAL",
     )
@@ -1694,14 +1695,14 @@ def build_capital_efficiency_bubble_chart(
     if "同业分类" not in rows.columns:
         rows["同业分类"] = ""
     rows = _clean_numeric(rows)
-    actual_units = [
+    asset_units = [
         str(value).strip()
         for value in rows.loc[
-            rows["指标编码"].astype(str).eq("ACTUAL_CAPITAL"), "单位"
+            rows["指标编码"].astype(str).eq("RECOGNIZED_ASSETS"), "单位"
         ].dropna().unique()
         if str(value).strip()
     ]
-    actual_unit = actual_units[0] if actual_units else ""
+    asset_unit = asset_units[0] if asset_units else ""
     pivot = rows.pivot_table(
         index=["公司", "同业分类"],
         columns="指标编码",
@@ -1713,20 +1714,20 @@ def build_capital_efficiency_bubble_chart(
         raise ValueError("最新报告期缺少气泡图所需指标。")
     pivot = pivot.dropna(subset=list(required_codes)).copy()
     pivot = pivot[
-        pivot["ACTUAL_CAPITAL"].ne(0)
+        pivot["REGISTERED_CAPITAL"].ne(0)
         & pivot["RECOGNIZED_ASSETS"].ne(0)
     ].copy()
     pivot["实际资本/认可资产"] = (
         pivot["ACTUAL_CAPITAL"] / pivot["RECOGNIZED_ASSETS"]
     )
-    pivot["核心资本/实际资本"] = (
+    pivot["核心资本/注册资本"] = (
         (pivot["CORE_T1_CAPITAL"] + pivot["CORE_T2_CAPITAL"])
-        / pivot["ACTUAL_CAPITAL"]
+        / pivot["REGISTERED_CAPITAL"]
     )
-    pivot["实际资本"] = pivot["ACTUAL_CAPITAL"]
-    pivot["气泡大小"] = pivot["ACTUAL_CAPITAL"].abs()
+    pivot["认可资产"] = pivot["RECOGNIZED_ASSETS"]
+    pivot["气泡大小"] = pivot["RECOGNIZED_ASSETS"].abs()
     pivot["报告期"] = latest_period
-    finite_columns = ["实际资本/认可资产", "核心资本/实际资本", "气泡大小"]
+    finite_columns = ["实际资本/认可资产", "核心资本/注册资本", "气泡大小"]
     finite_mask = pivot[finite_columns].apply(
         lambda column: column.map(lambda value: math.isfinite(float(value)))
     ).all(axis=1)
@@ -1734,14 +1735,14 @@ def build_capital_efficiency_bubble_chart(
     if pivot.empty:
         raise ValueError(f"{latest_period} 缺少可绘制的完整公司数据。")
     full_sample_x_median = float(pivot["实际资本/认可资产"].median())
-    full_sample_y_median = float(pivot["核心资本/实际资本"].median())
+    full_sample_y_median = float(pivot["核心资本/注册资本"].median())
     zoom_domain_source = pivot
     zoom_applied = False
     highlight = str(highlight_company or "").strip()
 
     if zoom_to_overlap_region and len(pivot) >= 2:
         x_field = "实际资本/认可资产"
-        y_field = "核心资本/实际资本"
+        y_field = "核心资本/注册资本"
         x_span = max(float(pivot[x_field].max() - pivot[x_field].min()), 1e-9)
         y_span = max(float(pivot[y_field].max() - pivot[y_field].min()), 1e-9)
         row_indices = list(pivot.index)
@@ -1817,7 +1818,7 @@ def build_capital_efficiency_bubble_chart(
                 zoom_applied = True
 
     pivot = pivot.sort_values(
-        ["实际资本/认可资产", "核心资本/实际资本"],
+        ["实际资本/认可资产", "核心资本/注册资本"],
         kind="stable",
     ).reset_index(drop=True)
 
@@ -1837,11 +1838,11 @@ def build_capital_efficiency_bubble_chart(
         if show_company_legend
         else None
     )
-    size_title = "实际资本" if not actual_unit else f"实际资本（{actual_unit}）"
+    size_title = "认可资产" if not asset_unit else f"认可资产（{asset_unit}）"
     size_legend_title = (
-        ["气泡大小代表", "实际资本金额"]
-        if not actual_unit
-        else ["气泡大小代表", f"实际资本金额（{actual_unit}）"]
+        ["气泡大小代表", "认可资产金额"]
+        if not asset_unit
+        else ["气泡大小代表", f"认可资产金额（{asset_unit}）"]
     )
     size_legend = (
         alt.Legend(
@@ -1881,7 +1882,7 @@ def build_capital_efficiency_bubble_chart(
         return [lower - padding, upper + padding]
 
     x_domain = padded_domain("实际资本/认可资产")
-    y_domain = padded_domain("核心资本/实际资本")
+    y_domain = padded_domain("核心资本/注册资本")
 
     def overridden_domain(key: str, fallback: list[float]) -> list[float]:
         if not zoom_domain_override or key not in zoom_domain_override:
@@ -1915,7 +1916,7 @@ def build_capital_efficiency_bubble_chart(
     border_color = "#D9DEE7"
     reference_color = "#C9CED6"
     x_title = "实际资本/认可资产（%）" if show_axis_titles else ""
-    y_title = "核心资本/实际资本（%）" if show_axis_titles else ""
+    y_title = "核心资本/注册资本（%）" if show_axis_titles else ""
     x_axis = alt.Axis(
         title=x_title,
         labelExpr="format(datum.value * 100, '.1f')",
@@ -1955,7 +1956,7 @@ def build_capital_efficiency_bubble_chart(
             scale=x_scale,
         ),
         y=alt.Y(
-            "核心资本/实际资本:Q",
+            "核心资本/注册资本:Q",
             title=y_title,
             axis=y_axis,
             scale=y_scale,
@@ -1981,8 +1982,8 @@ def build_capital_efficiency_bubble_chart(
             "同业分类:N",
             "报告期:N",
             alt.Tooltip("实际资本/认可资产:Q", format=".1%"),
-            alt.Tooltip("核心资本/实际资本:Q", format=".1%"),
-            alt.Tooltip("实际资本:Q", title=size_title, format=",.2f"),
+            alt.Tooltip("核心资本/注册资本:Q", format=".1%"),
+            alt.Tooltip("认可资产:Q", title=size_title, format=",.2f"),
         ],
     )
     if selection_name:
@@ -2168,6 +2169,19 @@ def _compact_scatter_axis(values: pd.Series) -> alt.Axis:
     return alt.Axis(format=f".{decimal_places}~f", tickCount=6)
 
 
+def _ratio_axis_display_scale(values: pd.Series) -> tuple[float, str]:
+    """Choose a readable display unit for a raw 0-1 ratio series."""
+    numeric = pd.to_numeric(values, errors="coerce").dropna().abs()
+    maximum = float(numeric.max()) if not numeric.empty else 0.0
+    if maximum >= 0.01:
+        return 100.0, "%"
+    if maximum >= 0.001:
+        return 1_000.0, "‰"
+    if maximum > 0:
+        return 10_000.0, "bp"
+    return 100.0, "%"
+
+
 def _scatter_zoom_source(
     pivot: pd.DataFrame,
     x_code: str,
@@ -2234,6 +2248,7 @@ def _scatter_padded_domain(
     field: str,
     *,
     zoomed: bool,
+    protect_bubbles: bool = False,
 ) -> list[float]:
     lower = float(domain_source[field].min())
     upper = float(domain_source[field].max())
@@ -2241,18 +2256,21 @@ def _scatter_padded_domain(
     if zoomed:
         center = (lower + upper) / 2
         if span > 1e-12:
-            domain_span = span * 1.35
+            domain_span = span * (1.55 if protect_bubbles else 1.35)
         else:
             full_span = float(full_sample[field].max() - full_sample[field].min())
             domain_span = (
-                full_span * 0.12
+                full_span * (0.20 if protect_bubbles else 0.12)
                 if full_span > 1e-12
-                else max(abs(center) * 0.08, 0.01)
+                else max(
+                    abs(center) * (0.15 if protect_bubbles else 0.08),
+                    0.01,
+                )
             )
         return [center - domain_span / 2, center + domain_span / 2]
     padding = max(
-        span * 0.08,
-        max(abs(lower), abs(upper)) * 0.025,
+        span * (0.18 if protect_bubbles else 0.08),
+        max(abs(lower), abs(upper)) * (0.06 if protect_bubbles else 0.025),
         0.01,
     )
     return [lower - padding, upper + padding]
@@ -2294,17 +2312,62 @@ def build_matrix_chart(
     linked_selection_name: str = "",
     zoom_domain_override: Mapping[str, Iterable[float]] | None = None,
     apply_theme: bool = True,
+    bubble_size_code: str = "",
+    bubble_size_label: str = "",
+    show_size_legend: bool = True,
 ) -> tuple[alt.Chart, str]:
-    rows = _clean_numeric(frame[frame["指标编码"].astype(str).isin([x_code, y_code])])
+    size_code = str(bubble_size_code or "").strip()
+    required_codes = [x_code, y_code]
+    if size_code:
+        required_codes.append(size_code)
+    rows = _clean_numeric(
+        frame[frame["指标编码"].astype(str).isin(required_codes)]
+    )
     periods = list(period_order)
     latest_period = periods[-1]
     latest = rows[rows["报告期"].astype(str).eq(latest_period)]
+    size_units = (
+        [
+            str(value).strip()
+            for value in latest.loc[
+                latest["指标编码"].astype(str).eq(size_code), "单位"
+            ].dropna().unique()
+            if str(value).strip()
+        ]
+        if size_code
+        else []
+    )
+    size_unit = size_units[0] if size_units else ""
     pivot = latest.pivot_table(
         index=["公司", "同业分类"], columns="指标编码", values="数值", aggfunc="first"
-    ).reset_index().dropna(subset=[x_code, y_code])
+    ).reset_index()
+    missing_columns = [code for code in required_codes if code not in pivot.columns]
+    if missing_columns:
+        raise ValueError(f"{latest_period} 缺少可绘制的完整公司数据。")
+    pivot = pivot.dropna(subset=required_codes).copy()
+    if size_code:
+        pivot["气泡大小"] = pd.to_numeric(
+            pivot[size_code], errors="coerce"
+        ).abs()
+        finite_size = pivot["气泡大小"].map(
+            lambda value: math.isfinite(float(value))
+        )
+        pivot = pivot[finite_size & pivot["气泡大小"].gt(0)].copy()
+    x_unit = ""
+    y_unit = ""
     if percentage_axes:
-        pivot[x_code] = pd.to_numeric(pivot[x_code], errors="coerce") * 100
-        pivot[y_code] = pd.to_numeric(pivot[y_code], errors="coerce") * 100
+        if size_code:
+            x_multiplier, x_unit = _ratio_axis_display_scale(pivot[x_code])
+            y_multiplier, y_unit = _ratio_axis_display_scale(pivot[y_code])
+        else:
+            x_multiplier, y_multiplier = 100.0, 100.0
+            x_unit, y_unit = "%", "%"
+        pivot[x_code] = (
+            pd.to_numeric(pivot[x_code], errors="coerce") * x_multiplier
+        )
+        pivot[y_code] = (
+            pd.to_numeric(pivot[y_code], errors="coerce") * y_multiplier
+        )
     if pivot.empty:
         raise ValueError(f"{latest_period} 缺少可绘制的完整公司数据。")
     full_sample_x_median = float(pivot[x_code].median())
@@ -2322,6 +2385,7 @@ def build_matrix_chart(
             zoom_source,
             x_code,
             zoomed=zoom_applied,
+            protect_bubbles=bool(size_code),
         ),
     )
     y_domain = _scatter_domain_override(
@@ -2332,6 +2396,7 @@ def build_matrix_chart(
             zoom_source,
             y_code,
             zoomed=zoom_applied,
+            protect_bubbles=bool(size_code),
         ),
     )
     selection_name = str(linked_selection_name or "").strip()
@@ -2346,7 +2411,7 @@ def build_matrix_chart(
             zero=False,
             nice=False,
         )
-    elif zoom_to_overlap_region or zoom_domain_override:
+    elif zoom_to_overlap_region or zoom_domain_override or size_code:
         x_scale = alt.Scale(domain=x_domain, zero=False, nice=False)
         y_scale = alt.Scale(domain=y_domain, zero=False, nice=False)
     else:
@@ -2372,8 +2437,8 @@ def build_matrix_chart(
     x_title = _metric_title(rows, x_code)
     y_title = _metric_title(rows, y_code)
     if percentage_axes:
-        x_title = f"{x_title}（%）"
-        y_title = f"{y_title}（%）"
+        x_title = f"{x_title}（{x_unit}）"
+        y_title = f"{y_title}（{y_unit}）"
     if not show_axis_titles:
         x_title = ""
         y_title = ""
@@ -2381,9 +2446,49 @@ def build_matrix_chart(
     x_axis = _compact_scatter_axis(axis_source[x_code]) if percentage_axes else alt.Axis()
     y_axis = _compact_scatter_axis(axis_source[y_code]) if percentage_axes else alt.Axis()
     tooltip_format = ".2f" if percentage_axes else ",.2f"
+    tooltip = [
+        "公司:N",
+        "同业分类:N",
+        alt.Tooltip(f"{x_code}:Q", title=x_title, format=tooltip_format),
+        alt.Tooltip(f"{y_code}:Q", title=y_title, format=tooltip_format),
+    ]
+    if size_code:
+        size_label = str(bubble_size_label or "").strip() or _metric_title(
+            rows, size_code
+        )
+        size_title = size_label if not size_unit else f"{size_label}（{size_unit}）"
+        size_legend_title = (
+            ["气泡大小代表", f"{size_label}金额"]
+            if not size_unit
+            else ["气泡大小代表", f"{size_label}金额（{size_unit}）"]
+        )
+        size_encoding = alt.Size(
+            "气泡大小:Q",
+            scale=alt.Scale(range=[180, 1800]),
+            legend=(
+                alt.Legend(
+                    title=size_legend_title,
+                    orient="right",
+                    direction="vertical",
+                    tickCount=3,
+                    format=",.1f",
+                    offset=24,
+                    padding=8,
+                )
+                if show_size_legend
+                else None
+            ),
+        )
+        tooltip.append(
+            alt.Tooltip(f"{size_code}:Q", title=size_title, format=",.2f")
+        )
+    else:
+        size_encoding = alt.condition(
+            alt.datum["是否追踪"], alt.value(230), alt.value(115)
+        )
     points = alt.Chart(pivot).mark_circle(
         opacity=0.96,
-        clip=zoom_to_overlap_region,
+        clip=bool(size_code) or zoom_to_overlap_region,
     ).encode(
         x=alt.X(
             f"{x_code}:Q",
@@ -2398,13 +2503,14 @@ def build_matrix_chart(
             axis=y_axis,
         ),
         color=alt.Color("公司:N", scale=scale, legend=legend),
-        size=alt.condition(alt.datum["是否追踪"], alt.value(230), alt.value(115)),
-        tooltip=[
-            "公司:N",
-            "同业分类:N",
-            alt.Tooltip(f"{x_code}:Q", title=x_title, format=tooltip_format),
-            alt.Tooltip(f"{y_code}:Q", title=y_title, format=tooltip_format),
-        ],
+        size=size_encoding,
+        stroke=alt.condition(
+            alt.datum["是否追踪"], alt.value("#00338D"), alt.value("#FFFFFF")
+        ),
+        strokeWidth=alt.condition(
+            alt.datum["是否追踪"], alt.value(3.0), alt.value(1.0)
+        ),
+        tooltip=tooltip,
     )
     border = None
     if selection_name:
@@ -2485,8 +2591,10 @@ def risk_ratio_scatter_default_domain(
     title: str,
     highlight_company: str = "",
     company_colors: Mapping[str, str] | None = None,
+    bubble_size_code: str = "",
+    bubble_size_label: str = "",
 ) -> tuple[dict[str, list[float]], str]:
-    """Return the initial linked local window for a risk-ratio scatter."""
+    """Return the initial linked local window for a risk-ratio bubble chart."""
     chart, latest_period = build_matrix_chart(
         frame,
         x_code,
@@ -2500,6 +2608,9 @@ def risk_ratio_scatter_default_domain(
         show_company_legend=False,
         show_axis_titles=False,
         apply_theme=False,
+        bubble_size_code=bubble_size_code,
+        bubble_size_label=bubble_size_label,
+        show_size_legend=False,
     )
     return matrix_chart_domain(chart, x_code, y_code), latest_period
 
@@ -2512,7 +2623,7 @@ def combine_linked_matrix_charts(
     selection_domain: Mapping[str, Iterable[float]],
     spacing: int = 20,
 ) -> alt.HConcatChart:
-    """Combine full and local scatter panels with a browser-side brush."""
+    """Combine full and local risk panels with a browser-side brush."""
     x_domain = [float(value) for value in selection_domain.get("x", ())]
     y_domain = [float(value) for value in selection_domain.get("y", ())]
     if len(x_domain) == 2 and len(y_domain) == 2:
@@ -2538,5 +2649,6 @@ def combine_linked_matrix_charts(
             x="independent",
             y="independent",
             color="shared",
+            size="shared",
         )
     )

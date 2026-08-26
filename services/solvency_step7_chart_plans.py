@@ -58,9 +58,9 @@ SPECIAL_CHART_PLANS: dict[str, ChartPlan] = {
     ),
     "资本使用效率与核心资本占比气泡图": ChartPlan(
         CAPITAL_EFFICIENCY_BUBBLE,
-        "最新报告期资本使用效率、核心资本占比与实际资本规模气泡图",
+        "最新报告期实际资本/认可资产、核心资本/注册资本与认可资产规模气泡图",
     ),
-    "注册资本/核心资本率": ChartPlan(
+    "核心资本/注册资本": ChartPlan(
         TREND_WITH_COMPANY_BARS,
         "多公司跨期折线图及统一纵轴的公司报告期柱状小图",
     ),
@@ -102,15 +102,15 @@ SPECIAL_CHART_PLANS: dict[str, ChartPlan] = {
     ),
     MARKET_RISK_ASSET_SCATTER: ChartPlan(
         RISK_RATIO_SCATTER,
-        "最新报告期利率风险与权益价格风险占认可资产率公司散点图",
+        "最新报告期利率风险与权益价格风险占认可资产率公司气泡图",
     ),
     CREDIT_RISK_ASSET_SCATTER: ChartPlan(
         RISK_RATIO_SCATTER,
-        "最新报告期利差风险与对手违约风险占认可资产率公司散点图",
+        "最新报告期利差风险与对手违约风险占认可资产率公司气泡图",
     ),
     INSURANCE_RISK_LIABILITY_SCATTER: ChartPlan(
         RISK_RATIO_SCATTER,
-        "最新报告期寿险与非寿险保险风险占认可负债率公司散点图",
+        "最新报告期寿险与非寿险保险风险占认可负债率公司气泡图",
     ),
     "增资发债信息统计": ChartPlan(
         FINANCING_TABLE,
