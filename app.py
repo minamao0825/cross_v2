@@ -201,11 +201,14 @@ def _render_login_page() -> None:
         .stApp {background: linear-gradient(135deg, #040B16 0%, #0A1931 50%, #002266 100%); color: #E2E8F0;}
         [data-testid="column"]:nth-of-type(2) {background: rgba(255,255,255,0.08); backdrop-filter: blur(25px); -webkit-backdrop-filter: blur(25px); border-radius: 20px; border: 1px solid rgba(0,243,255,0.3); box-shadow: 0 15px 35px rgba(0,0,0,0.5), inset 0 0 15px rgba(0,243,255,0.15); padding: 40px 30px; margin-top: 6vh;}
         .title-glow {background: linear-gradient(90deg, #FFFFFF 0%, #76D2FF 50%, #00F3FF 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-weight: 900; filter: drop-shadow(0 0 15px rgba(0,243,255,0.6));}
-        div[data-baseweb="input"]>div, div[data-baseweb="select"]>div {background: rgba(0,0,0,0.4)!important; border: 1px solid rgba(0,243,255,0.3)!important; border-radius: 8px!important;}
+        div[data-baseweb="input"]>div, div[data-baseweb="select"]>div {background: #F4F6FA!important; border: 1px solid rgba(0,243,255,0.3)!important; border-radius: 8px!important;}
         div[data-baseweb="input"]>div:focus-within, div[data-baseweb="select"]>div:focus-within {border-color: #00F3FF!important; box-shadow: 0 0 12px rgba(0,243,255,0.5)!important;}
         div[data-testid="stRadio"] label p {color: #FFFFFF!important; font-weight: bold!important; font-size: 14px!important;}
         label p, .stSelectbox label p, .stTextInput label p {color: #00F3FF!important; letter-spacing: 1px!important;}
-        input, .stSelectbox span {color: #FFFFFF!important; font-size: 14px!important;}
+        div[data-baseweb="input"] input {color: #31333F!important; -webkit-text-fill-color: #31333F!important; caret-color: #00338D!important; font-size: 14px!important;}
+        div[data-baseweb="input"] input::placeholder {color: #7A8290!important; -webkit-text-fill-color: #7A8290!important; opacity: 1!important;}
+        div[data-baseweb="select"] span {color: #31333F!important; -webkit-text-fill-color: #31333F!important; font-size: 14px!important;}
+        div[data-baseweb="select"] svg {color: #31333F!important; fill: #31333F!important;}
         button[kind="primary"] {background: linear-gradient(90deg, #0044CC, #0088FF)!important; border: 1px solid rgba(0,243,255,0.5)!important; box-shadow: 0 0 15px rgba(0,136,255,0.4)!important; color: white!important; font-weight: bold!important; letter-spacing: 2px!important; border-radius: 8px!important; margin-top: 5px!important;}
         button[kind="primary"]:hover {box-shadow: 0 0 25px rgba(0,243,255,0.8)!important; transform: scale(1.02);}
         [data-testid="stPopover"] {display: flex; justify-content: flex-end;}
