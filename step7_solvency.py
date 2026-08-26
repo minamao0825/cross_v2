@@ -184,16 +184,19 @@ RISK_RATIO_SCATTER_SPECS = {
     MARKET_RISK_ASSET_SCATTER: (
         "INTEREST_RATE_RISK_TO_ASSETS",
         "EQUITY_RISK_TO_ASSETS",
+        "RECOGNIZED_ASSETS",
         "认可资产",
     ),
     CREDIT_RISK_ASSET_SCATTER: (
         "SPREAD_RISK_TO_ASSETS",
         "COUNTERPARTY_RISK_TO_ASSETS",
+        "RECOGNIZED_ASSETS",
         "认可资产",
     ),
     INSURANCE_RISK_LIABILITY_SCATTER: (
         "LIFE_INSURANCE_RISK_TO_LIABILITIES",
         "NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",
+        "RECOGNIZED_LIABILITIES",
         "认可负债",
     ),
 }
@@ -908,7 +911,10 @@ def _ai_analysis_for_latest_period(
         "model": str(st.session_state.get("llm_model", "")).strip(),
     }
     if not all(settings.values()):
-        return "请先在 Step 1 的“大模型接口设置”中完整填写接口地址、模型名称和 API Key。", True
+        return (
+            "当前登录会话的 AI 配置不完整。请退出登录，在登录页填写 "
+            "Base URL、模型名称和 API Key 后重新进入。"
+        ), True
     company_values = "、".join(
         f"{row['公司']}={format_chart_value(row['数值'], row.get('单位', ''), row.get('数据类型', ''))}"
         for _, row in latest.sort_values("数值", ascending=False).iterrows()
@@ -1259,8 +1265,8 @@ def _render_capital_efficiency_bubble_fragment(
     except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
         overlap_error = str(exc)
     st.caption(
-        f"展示 {latest_period}：横轴为实际资本/认可资产，纵轴为核心资本/实际资本，"
-        "气泡面积代表实际资本规模；浅灰虚线为全样本横纵指标中位数。"
+        f"展示 {latest_period}：横轴为实际资本/认可资产，纵轴为核心资本/注册资本，"
+        "气泡面积代表认可资产规模；浅灰虚线为全样本横纵指标中位数。"
     )
     if overlap_chart is not None:
         bubble_pair = combine_capital_efficiency_bubble_charts(
@@ -1296,9 +1302,10 @@ def _render_risk_ratio_scatter_fragment(
     chart_name: str,
     x_code: str,
     y_code: str,
+    bubble_size_code: str,
     denominator_label: str,
 ) -> None:
-    """Render linked full/local risk scatters without Python selection reruns."""
+    """Render linked full/local risk bubbles without Python selection reruns."""
     panel_height = 430
     state_prefix = f"risk_ratio_scatter_zoom_{x_code.lower()}_{y_code.lower()}"
     signature_key = f"{state_prefix}_signature"
@@ -1313,6 +1320,7 @@ def _render_risk_ratio_scatter_fragment(
         else ""
     )
     sample_signature = (
+        "adaptive_risk_bubble_axes_v2",
         chart_name,
         tuple(periods),
         available_companies,
@@ -1339,6 +1347,8 @@ def _render_risk_ratio_scatter_fragment(
             chart_name,
             tracked_company,
             company_colors,
+            bubble_size_code=bubble_size_code,
+            bubble_size_label=denominator_label,
         )
         full_chart, _ = build_matrix_chart(
             converted,
@@ -1354,6 +1364,8 @@ def _render_risk_ratio_scatter_fragment(
             chart_height=panel_height,
             linked_selection_name=selection_name,
             apply_theme=False,
+            bubble_size_code=bubble_size_code,
+            bubble_size_label=denominator_label,
         )
     except ValueError as exc:
         st.warning(str(exc))
@@ -1395,13 +1407,18 @@ def _render_risk_ratio_scatter_fragment(
             show_axis_titles=False,
             linked_selection_name=selection_name,
             apply_theme=False,
+            bubble_size_code=bubble_size_code,
+            bubble_size_label=denominator_label,
+            show_size_legend=False,
         )
         local_chart.to_dict(validate=True)
     except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
         local_error = str(exc)
 
     st.caption(
-        f"展示 {latest_period}；每个数据点代表一家公司，横纵轴均为占{denominator_label}的比例；"
+        f"展示 {latest_period}；每个气泡代表一家公司，横纵轴均为占{denominator_label}的比例，"
+        f"气泡面积代表{denominator_label}规模；"
+        "横纵轴根据各指标量级自动采用%、‰或基点（bp），具体单位见坐标轴标题；"
         "浅灰虚线为全样本横纵指标中位数。"
     )
     if local_chart is not None:
@@ -1482,7 +1499,7 @@ def _render_combination_analysis(
                 (period_colors[period], period, "square")
                 for period in periods
             ],
-            ("#FD349C", "核心偿付能力充足率", "line"),
+            ("#FD349C", "核心偿付能力充足率（%）", "line"),
         ])
         _render_company_chart_grid(
             converted,
@@ -1783,7 +1800,9 @@ def _render_combination_analysis(
         )
         st.caption("深蓝虚线为样本中位数，用于识别市场风险和信用风险同时偏高的公司。")
     elif plan.kind == RISK_RATIO_SCATTER:
-        x_code, y_code, denominator_label = RISK_RATIO_SCATTER_SPECS[chart_name]
+        x_code, y_code, bubble_size_code, denominator_label = (
+            RISK_RATIO_SCATTER_SPECS[chart_name]
+        )
         if chart_name in RISK_SCATTER_DUAL_VIEW_CHARTS:
             _render_risk_ratio_scatter_fragment(
                 converted,
@@ -1794,6 +1813,7 @@ def _render_combination_analysis(
                 chart_name,
                 x_code,
                 y_code,
+                bubble_size_code,
                 denominator_label,
             )
         else:
@@ -1806,12 +1826,15 @@ def _render_combination_analysis(
                 highlight_company,
                 company_colors=company_colors,
                 percentage_axes=True,
+                bubble_size_code=bubble_size_code,
+                bubble_size_label=denominator_label,
             )
             centered_chart = _chart_without_internal_title(chart).properties(
                 width=RISK_SCATTER_DISPLAY_WIDTH
             )
             st.caption(
-                f"展示 {latest_period}；每个数据点代表一家公司，横纵轴均为占{denominator_label}的比例；"
+                f"展示 {latest_period}；每个气泡代表一家公司，横纵轴均为占{denominator_label}的比例，"
+                f"气泡面积代表{denominator_label}规模；"
                 "深蓝虚线为样本横纵指标中位数。"
             )
             with st.container(horizontal_alignment="center"):
@@ -1903,7 +1926,7 @@ def show_step_7_solvency(
                 "一键AI分析",
                 value=False,
                 key="s7_enable_ai",
-                help="使用 Step 1/2 已配置的大模型接口，为当前图表生成一句同业对标点评。",
+                help="使用登录页配置的大模型接口，为当前图表生成一句同业对标点评。",
             )
             ai_data_consent = False
             if enable_ai:

@@ -75,7 +75,11 @@ class SolvencyNavigationTests(unittest.TestCase):
         )
         self.assertEqual(
             metric_codes_for_chart(MARKET_RISK_ASSET_SCATTER),
-            ("INTEREST_RATE_RISK_TO_ASSETS", "EQUITY_RISK_TO_ASSETS"),
+            (
+                "INTEREST_RATE_RISK_TO_ASSETS",
+                "EQUITY_RISK_TO_ASSETS",
+                "RECOGNIZED_ASSETS",
+            ),
         )
         self.assertIn(
             CREDIT_RISK_ASSET_SCATTER,
@@ -83,7 +87,11 @@ class SolvencyNavigationTests(unittest.TestCase):
         )
         self.assertEqual(
             metric_codes_for_chart(CREDIT_RISK_ASSET_SCATTER),
-            ("SPREAD_RISK_TO_ASSETS", "COUNTERPARTY_RISK_TO_ASSETS"),
+            (
+                "SPREAD_RISK_TO_ASSETS",
+                "COUNTERPARTY_RISK_TO_ASSETS",
+                "RECOGNIZED_ASSETS",
+            ),
         )
         self.assertIn(
             "各类保险风险（寿）占比",
@@ -102,7 +110,12 @@ class SolvencyNavigationTests(unittest.TestCase):
             (
                 "LIFE_INSURANCE_RISK_TO_LIABILITIES",
                 "NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",
+                "RECOGNIZED_LIABILITIES",
             ),
+        )
+        self.assertEqual(
+            metric_codes_for_chart("核心资本/注册资本"),
+            ("CORE_CAPITAL_TO_REGISTERED_CAPITAL",),
         )
         removed_duplicate_charts = {
             "寿险业务保险风险最低资本占比",
@@ -160,7 +173,13 @@ class SolvencyNavigationTests(unittest.TestCase):
         )
         self.assertEqual(
             metric_codes_for_chart("资本使用效率与核心资本占比气泡图"),
-            ("ACTUAL_CAPITAL", "RECOGNIZED_ASSETS", "CORE_T1_CAPITAL", "CORE_T2_CAPITAL"),
+            (
+                "ACTUAL_CAPITAL",
+                "RECOGNIZED_ASSETS",
+                "REGISTERED_CAPITAL",
+                "CORE_T1_CAPITAL",
+                "CORE_T2_CAPITAL",
+            ),
         )
         self.assertEqual(
             KPMG_BRIGHT_CHART_COLORS[:4],

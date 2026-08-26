@@ -457,7 +457,7 @@ show_step_7_solvency(frame)
             chart_plan_for("资本使用效率与核心资本占比气泡图").kind,
             CAPITAL_EFFICIENCY_BUBBLE,
         )
-        self.assertEqual(chart_plan_for("注册资本/核心资本率").kind, TREND_WITH_COMPANY_BARS)
+        self.assertEqual(chart_plan_for("核心资本/注册资本").kind, TREND_WITH_COMPANY_BARS)
         self.assertEqual(
             chart_plan_for("计入核心资本的保单未来盈余/核心资本的比例").kind,
             TREND_WITH_COMPANY_BARS,
@@ -469,24 +469,25 @@ show_step_7_solvency(frame)
         source = inspect.getsource(_render_combination_analysis)
         self.assertIn("图表说明：柱状图为综合偿付能力充足率", source)
         self.assertIn("粉色折线为核心偿付能力充足率", source)
+        self.assertIn("核心偿付能力充足率（%）", source)
         self.assertEqual(
-            chart_plan_for("利率与权益价格风险占认可资产率散点图").kind,
+            chart_plan_for("利率与权益价格风险占认可资产率气泡图").kind,
             RISK_RATIO_SCATTER,
         )
         self.assertEqual(
-            chart_plan_for("利差与对手违约风险占认可资产率散点图").kind,
+            chart_plan_for("利差与对手违约风险占认可资产率气泡图").kind,
             RISK_RATIO_SCATTER,
         )
         self.assertEqual(
-            chart_plan_for("寿险与非寿险保险风险占认可负债率散点图").kind,
+            chart_plan_for("寿险与非寿险保险风险占认可负债率气泡图").kind,
             RISK_RATIO_SCATTER,
         )
         self.assertEqual(
             RISK_SCATTER_DUAL_VIEW_CHARTS,
             {
-                "利率与权益价格风险占认可资产率散点图",
-                "利差与对手违约风险占认可资产率散点图",
-                "寿险与非寿险保险风险占认可负债率散点图",
+                "利率与权益价格风险占认可资产率气泡图",
+                "利差与对手违约风险占认可资产率气泡图",
+                "寿险与非寿险保险风险占认可负债率气泡图",
             },
         )
         self.assertEqual(RISK_SCATTER_DISPLAY_WIDTH, 750)
@@ -502,18 +503,20 @@ show_step_7_solvency(frame)
         self.assertIn("build_single_metric_trend_charts", metric_render_source)
         self.assertIn("company_period_bars", metric_render_source)
 
-    def test_capital_efficiency_bubble_uses_latest_period_and_actual_capital_size(self):
+    def test_capital_efficiency_bubble_uses_core_registered_ratio_and_asset_size(self):
         periods = ["2025Q2", "2025Q4"]
         latest_values = {
             "甲": {
                 "ACTUAL_CAPITAL": 20.0,
                 "RECOGNIZED_ASSETS": 100.0,
+                "REGISTERED_CAPITAL": 28.0,
                 "CORE_T1_CAPITAL": 12.0,
                 "CORE_T2_CAPITAL": 2.0,
             },
             "乙": {
                 "ACTUAL_CAPITAL": 30.0,
                 "RECOGNIZED_ASSETS": 120.0,
+                "REGISTERED_CAPITAL": 36.0,
                 "CORE_T1_CAPITAL": 15.0,
                 "CORE_T2_CAPITAL": 3.0,
             },
@@ -560,7 +563,7 @@ show_step_7_solvency(frame)
         )
         self.assertEqual(
             bubble_layer["encoding"]["y"]["title"],
-            "核心资本/实际资本（%）",
+            "核心资本/注册资本（%）",
         )
         self.assertNotIn("format", bubble_layer["encoding"]["x"]["axis"])
         self.assertEqual(
@@ -586,7 +589,7 @@ show_step_7_solvency(frame)
         self.assertEqual(bubble_layer["encoding"]["size"]["field"], "气泡大小")
         self.assertEqual(
             bubble_layer["encoding"]["size"]["legend"]["title"],
-            ["气泡大小代表", "实际资本金额（亿元）"],
+            ["气泡大小代表", "认可资产金额（亿元）"],
         )
         self.assertEqual(
             bubble_layer["encoding"]["size"]["legend"]["tickCount"],
@@ -616,8 +619,8 @@ show_step_7_solvency(frame)
         self.assertEqual(set(plotted), {"甲", "乙"})
         self.assertTrue(all(row["报告期"] == "2025Q4" for row in plotted.values()))
         self.assertAlmostEqual(plotted["甲"]["实际资本/认可资产"], 0.20)
-        self.assertAlmostEqual(plotted["甲"]["核心资本/实际资本"], 0.70)
-        self.assertAlmostEqual(plotted["甲"]["气泡大小"], 20.0)
+        self.assertAlmostEqual(plotted["甲"]["核心资本/注册资本"], 0.50)
+        self.assertAlmostEqual(plotted["甲"]["气泡大小"], 100.0)
         self.assertTrue(all("标签位置" not in row for row in plotted.values()))
 
     def test_capital_efficiency_overlap_zoom_selects_closest_pair(self):
@@ -635,6 +638,7 @@ show_step_7_solvency(frame)
             values = {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": assets,
+                "REGISTERED_CAPITAL": actual,
                 "CORE_T1_CAPITAL": core,
                 "CORE_T2_CAPITAL": 0.0,
             }
@@ -676,7 +680,7 @@ show_step_7_solvency(frame)
             row["公司"]
             for row in spec["datasets"][dataset_name]
             if x_domain[0] <= row["实际资本/认可资产"] <= x_domain[1]
-            and y_domain[0] <= row["核心资本/实际资本"] <= y_domain[1]
+            and y_domain[0] <= row["核心资本/注册资本"] <= y_domain[1]
         }
         self.assertEqual(visible_companies, {"建信人寿", "农银人寿", "中邮人寿"})
         selected_x = [companies[name][0] / 100 for name in visible_companies]
@@ -692,7 +696,7 @@ show_step_7_solvency(frame)
         self.assertIsNone(bubble_layer["encoding"]["color"]["legend"])
         self.assertEqual(
             bubble_layer["encoding"]["size"]["legend"]["title"],
-            ["气泡大小代表", "实际资本金额（亿元）"],
+            ["气泡大小代表", "认可资产金额（亿元）"],
         )
         self.assertEqual(bubble_layer["encoding"]["x"]["axis"]["title"], "")
         self.assertEqual(bubble_layer["encoding"]["y"]["axis"]["title"], "")
@@ -723,6 +727,7 @@ show_step_7_solvency(frame)
             values = {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": 100.0,
+                "REGISTERED_CAPITAL": actual,
                 "CORE_T1_CAPITAL": actual * core_share,
                 "CORE_T2_CAPITAL": 0.0,
             }
@@ -758,7 +763,7 @@ show_step_7_solvency(frame)
             row["公司"]
             for row in spec["datasets"][dataset_name]
             if x_domain[0] <= row["实际资本/认可资产"] <= x_domain[1]
-            and y_domain[0] <= row["核心资本/实际资本"] <= y_domain[1]
+            and y_domain[0] <= row["核心资本/注册资本"] <= y_domain[1]
         }
         self.assertEqual(visible_companies, {"密集甲", "密集乙", "密集丙"})
 
@@ -773,6 +778,7 @@ show_step_7_solvency(frame)
             for code, value in {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": 100.0,
+                "REGISTERED_CAPITAL": actual,
                 "CORE_T1_CAPITAL": actual * core_share,
                 "CORE_T2_CAPITAL": 0.0,
             }.items():
@@ -817,6 +823,7 @@ show_step_7_solvency(frame)
             for code, value in {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": 100.0,
+                "REGISTERED_CAPITAL": actual,
                 "CORE_T1_CAPITAL": actual * core_share,
                 "CORE_T2_CAPITAL": 0.0,
             }.items():
@@ -883,6 +890,7 @@ show_step_7_solvency(frame)
             for code, value in {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": 100.0,
+                "REGISTERED_CAPITAL": actual,
                 "CORE_T1_CAPITAL": actual * core_share,
                 "CORE_T2_CAPITAL": 0.0,
             }.items():
@@ -1006,15 +1014,15 @@ show_step_7_solvency(frame)
             1120,
         )
 
-    def test_registered_capital_to_core_capital_company_bars_share_axis_and_period_colors(self):
-        code = "REGISTERED_CAPITAL_TO_CORE_CAPITAL"
+    def test_core_capital_to_registered_capital_company_bars_share_axis_and_period_colors(self):
+        code = "CORE_CAPITAL_TO_REGISTERED_CAPITAL"
         periods = ["2024Q4", "2025Q2", "2025Q4"]
         frame = pd.DataFrame([
             {
                 "公司": company,
                 "报告期": period,
                 "指标编码": code,
-                "指标名称": "注册资本/核心资本",
+                "指标名称": "核心资本/注册资本",
                 "数值": value,
                 "单位": "倍",
             }
@@ -1299,11 +1307,11 @@ show_step_7_solvency(frame)
         ))
         self.assertEqual(matrix_color_map, colors)
 
-    def test_risk_asset_scatter_uses_latest_period_and_percentage_axes(self):
+    def test_risk_asset_bubble_uses_adaptive_units_padding_and_asset_size(self):
         rows = []
-        for company, interest, equity in [
-            ("甲", 0.012, 0.0002),
-            ("乙", 0.018, 0.0011),
+        for company, interest, equity, assets in [
+            ("甲", 0.012, 0.0002, 1_000.0),
+            ("乙", 0.018, 0.0011, 2_000.0),
         ]:
             for period, shift in [("2025Q2", -0.005), ("2025Q4", 0.0)]:
                 rows.extend([
@@ -1325,14 +1333,25 @@ show_step_7_solvency(frame)
                         "数值": equity + shift,
                         "单位": "倍",
                     },
+                    {
+                        "公司": company,
+                        "同业分类": "主体样本",
+                        "报告期": period,
+                        "指标编码": "RECOGNIZED_ASSETS",
+                        "指标名称": "认可资产",
+                        "数值": assets,
+                        "单位": "亿元",
+                    },
                 ])
         chart, latest_period = build_matrix_chart(
             pd.DataFrame(rows),
             "INTEREST_RATE_RISK_TO_ASSETS",
             "EQUITY_RISK_TO_ASSETS",
             ["2025Q2", "2025Q4"],
-            "利率与权益价格风险占认可资产率散点图",
+            "利率与权益价格风险占认可资产率气泡图",
             percentage_axes=True,
+            bubble_size_code="RECOGNIZED_ASSETS",
+            bubble_size_label="认可资产",
         )
         spec = chart.to_dict(validate=True)
         dataset = spec["datasets"][spec["layer"][0]["data"]["name"]]
@@ -1344,13 +1363,28 @@ show_step_7_solvency(frame)
         }
         self.assertAlmostEqual(latest_values["甲"], 1.2)
         self.assertAlmostEqual(latest_values["乙"], 1.8)
+        latest_y_values = {
+            row["公司"]: row["EQUITY_RISK_TO_ASSETS"]
+            for row in dataset
+        }
+        self.assertAlmostEqual(latest_y_values["甲"], 0.2)
+        self.assertAlmostEqual(latest_y_values["乙"], 1.1)
+        self.assertEqual(spec["layer"][0]["encoding"]["size"]["field"], "气泡大小")
+        self.assertEqual(
+            spec["layer"][0]["encoding"]["size"]["legend"]["title"],
+            ["气泡大小代表", "认可资产金额（亿元）"],
+        )
+        self.assertEqual(
+            {row["公司"]: row["气泡大小"] for row in dataset},
+            {"甲": 1_000.0, "乙": 2_000.0},
+        )
         self.assertEqual(
             spec["layer"][0]["encoding"]["x"]["axis"]["format"],
             ".1~f",
         )
         self.assertEqual(
             spec["layer"][0]["encoding"]["y"]["axis"]["format"],
-            ".2~f",
+            ".1~f",
         )
         self.assertEqual(
             spec["layer"][0]["encoding"]["x"]["axis"]["tickCount"],
@@ -1365,6 +1399,17 @@ show_step_7_solvency(frame)
             "利率风险/认可资产（%）",
         )
         self.assertEqual(
+            spec["layer"][0]["encoding"]["y"]["title"],
+            "权益价格风险/认可资产（‰）",
+        )
+        self.assertTrue(spec["layer"][0]["mark"]["clip"])
+        x_domain = spec["layer"][0]["encoding"]["x"]["scale"]["domain"]
+        y_domain = spec["layer"][0]["encoding"]["y"]["scale"]["domain"]
+        self.assertLess(x_domain[0], min(latest_values.values()) - 0.10)
+        self.assertGreater(x_domain[1], max(latest_values.values()) + 0.10)
+        self.assertLess(y_domain[0], min(latest_y_values.values()) - 0.10)
+        self.assertGreater(y_domain[1], max(latest_y_values.values()) + 0.10)
+        self.assertEqual(
             spec["layer"][0]["encoding"]["tooltip"][2]["format"],
             ".2f",
         )
@@ -1372,21 +1417,26 @@ show_step_7_solvency(frame)
             spec["layer"][0]["encoding"]["tooltip"][2]["title"],
             "利率风险/认可资产（%）",
         )
+        self.assertEqual(
+            spec["layer"][0]["encoding"]["tooltip"][3]["title"],
+            "权益价格风险/认可资产（‰）",
+        )
 
     def test_requested_risk_scatters_use_linked_full_and_local_views(self):
         rows = []
         companies = {
-            "聚集甲": (0.100, 0.200),
-            "聚集乙": (0.101, 0.201),
-            "聚集丙": (0.102, 0.198),
-            "聚集丁": (0.103, 0.199),
-            "远端甲": (0.200, 0.400),
-            "远端乙": (0.300, 0.100),
+            "聚集甲": (0.100, 0.200, 1_000.0),
+            "聚集乙": (0.101, 0.201, 1_100.0),
+            "聚集丙": (0.102, 0.198, 1_200.0),
+            "聚集丁": (0.103, 0.199, 1_300.0),
+            "远端甲": (0.200, 0.400, 2_000.0),
+            "远端乙": (0.300, 0.100, 3_000.0),
         }
-        for company, (interest, equity) in companies.items():
+        for company, (interest, equity, assets) in companies.items():
             for code, value in {
                 "INTEREST_RATE_RISK_TO_ASSETS": interest,
                 "EQUITY_RISK_TO_ASSETS": equity,
+                "RECOGNIZED_ASSETS": assets,
             }.items():
                 rows.append({
                     "公司": company,
@@ -1395,7 +1445,7 @@ show_step_7_solvency(frame)
                     "指标编码": code,
                     "指标名称": code,
                     "数值": value,
-                    "单位": "倍",
+                    "单位": "亿元" if code == "RECOGNIZED_ASSETS" else "倍",
                 })
         frame = pd.DataFrame(rows)
         colors = {company: "#00338D" for company in companies}
@@ -1404,8 +1454,10 @@ show_step_7_solvency(frame)
             "INTEREST_RATE_RISK_TO_ASSETS",
             "EQUITY_RISK_TO_ASSETS",
             ["2025Q4"],
-            "利率与权益价格风险占认可资产率散点图",
+            "利率与权益价格风险占认可资产率气泡图",
             company_colors=colors,
+            bubble_size_code="RECOGNIZED_ASSETS",
+            bubble_size_label="认可资产",
         )
         self.assertEqual(latest_period, "2025Q4")
         self.assertLess(selection_domain["x"][1], 20.0)
@@ -1414,7 +1466,7 @@ show_step_7_solvency(frame)
             "INTEREST_RATE_RISK_TO_ASSETS",
             "EQUITY_RISK_TO_ASSETS",
             ["2025Q4"],
-            "利率与权益价格风险占认可资产率散点图",
+            "利率与权益价格风险占认可资产率气泡图",
             company_colors=colors,
             percentage_axes=True,
             panel_label="全样本图",
@@ -1422,13 +1474,15 @@ show_step_7_solvency(frame)
             chart_height=430,
             linked_selection_name="risk_ratio_zoom_test",
             apply_theme=False,
+            bubble_size_code="RECOGNIZED_ASSETS",
+            bubble_size_label="认可资产",
         )
         local_chart, _ = build_matrix_chart(
             frame,
             "INTEREST_RATE_RISK_TO_ASSETS",
             "EQUITY_RISK_TO_ASSETS",
             ["2025Q4"],
-            "利率与权益价格风险占认可资产率散点图",
+            "利率与权益价格风险占认可资产率气泡图",
             company_colors=colors,
             percentage_axes=True,
             zoom_to_overlap_region=True,
@@ -1437,6 +1491,9 @@ show_step_7_solvency(frame)
             chart_height=430,
             linked_selection_name="risk_ratio_zoom_test",
             apply_theme=False,
+            bubble_size_code="RECOGNIZED_ASSETS",
+            bubble_size_label="认可资产",
+            show_size_legend=False,
         )
         linked = combine_linked_matrix_charts(
             full_chart,
@@ -1469,6 +1526,11 @@ show_step_7_solvency(frame)
             local_points["encoding"]["x"]["scale"]["domain"],
             {"param": "risk_ratio_zoom_test", "encoding": "x"},
         )
+        self.assertEqual(
+            linked["hconcat"][0]["layer"][0]["encoding"]["size"]["field"],
+            "气泡大小",
+        )
+        self.assertEqual(linked["resolve"]["scale"]["size"], "shared")
 
     def test_risk_scatter_dragging_stays_browser_side_and_print_hides_brush(self):
         renderer = getattr(

@@ -29,7 +29,8 @@ class ReportNotesTests(unittest.TestCase):
         self.assertNotIn("核心充足率柱状图", company["对应图表名称"].tolist())
         self.assertNotIn("综合充足率柱状图", company["对应图表名称"].tolist())
         self.assertIn("综合充足率变化", company["对应图表名称"].tolist())
-        self.assertIn("注册资本/核心资本率", company["对应图表名称"].tolist())
+        self.assertIn("核心资本/注册资本", company["对应图表名称"].tolist())
+        self.assertNotIn("注册资本/核心资本率", company["对应图表名称"].tolist())
         self.assertNotIn("核心资本/注册资本率", company["对应图表名称"].tolist())
         self.assertIn("量化风险最低资本构成", company["对应图表名称"].tolist())
         self.assertEqual(
@@ -125,7 +126,7 @@ class ReportNotesTests(unittest.TestCase):
             "旧版核心资本分析",
         )
 
-    def test_old_capital_efficiency_note_migrates_to_reversed_ratio_chart(self):
+    def test_old_capital_efficiency_note_migrates_to_core_registered_chart(self):
         uploaded = pd.DataFrame([{
             "模块ID": "OLD_CAPITAL_EFFICIENCY",
             "一级分类": "关键偿付数据概览",
@@ -135,7 +136,7 @@ class ReportNotesTests(unittest.TestCase):
         }])
         lookup = notes_lookup(overlay_notes(company_notes_template(), uploaded))
         self.assertEqual(
-            lookup["注册资本/核心资本率"]["分析内容-自定义"],
+            lookup["核心资本/注册资本"]["分析内容-自定义"],
             "旧版资本使用效率分析",
         )
 

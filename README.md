@@ -178,9 +178,11 @@ streamlit run app.py
 
 启动后访问 `http://localhost:8501`。
 
-## 大模型配置
+## 登录与大模型配置
 
-STEP1 和 STEP2 共用页面中的模型服务地址、模型名称和 API Key。处理扫描版或纯图片 PDF 时，所选模型及兼容接口必须支持 `image_url` 图片输入；仅支持文本的模型会收到明确提示，并可改为人工填写物理页码。API Key 不应写入代码、配置表或 Git 历史；请为正式环境使用独立的服务凭据和访问控制。
+登录页提供“普通用户”和“项目组成员”两个通道。项目组成员可使用 STEP0-STEP8；普通用户仅显示 STEP6 自定义分析与 STEP7 公司报告。默认安全码与年报平台保持一致，部署时可分别通过 `SOLVENCY_USER_ACCESS_CODE` 和 `SOLVENCY_PROJECT_ACCESS_CODE` 环境变量覆盖。
+
+STEP1、STEP2 和 STEP7 共用登录页中选择的模型服务商、Base URL、模型名称和 API Key。如需更换模型配置，请退出后重新登录。处理扫描版或纯图片 PDF 时，所选模型及兼容接口必须支持 `image_url` 图片输入；仅支持文本的模型会收到明确提示，并可改为人工填写物理页码。API Key 只保存在当前浏览器会话，退出登录后清除，不应写入代码、配置表或 Git 历史；请为正式环境使用独立的服务凭据和访问控制。
 
 ## Streamlit Community Cloud 部署
 
