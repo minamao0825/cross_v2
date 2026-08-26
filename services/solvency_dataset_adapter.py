@@ -352,8 +352,20 @@ def _industry_metric_records(
     return records
 
 
+def _standardize_with_company_identities(frame: pd.DataFrame) -> pd.DataFrame:
+    """Standardize a frame without re-resolving identities already supplied."""
+    source = standardize_uploaded_frame(frame)
+    identity_columns = ("公司", "原始公司名称", "标准公司名称", "公司统一编码", "公司类型")
+    if source.empty or all(
+        source[column].fillna("").astype(str).str.strip().ne("").all()
+        for column in identity_columns
+    ):
+        return source
+    return apply_company_identities(source)
+
+
 def append_derived_metrics(frame: pd.DataFrame) -> pd.DataFrame:
-    source = apply_company_identities(standardize_uploaded_frame(frame))
+    source = _standardize_with_company_identities(frame)
     if source.empty:
         return source
     if "报告类型" not in source.columns:
@@ -428,7 +440,7 @@ def add_missing_derived_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     This helper keeps every supplied row and appends only derived metric keys that are
     absent and can be calculated from the available base indicators.
     """
-    source = apply_company_identities(standardize_uploaded_frame(frame))
+    source = _standardize_with_company_identities(frame)
     if source.empty:
         return source
 
@@ -482,6 +494,53 @@ def add_missing_derived_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     existing_keys = set(row_keys(existing).tolist()) if not existing.empty else set()
     missing_mask = ~row_keys(candidates).isin(existing_keys)
     additions = candidates.loc[missing_mask]
+    if additions.empty:
+        return source
+    return pd.concat([source, additions], ignore_index=True)
+
+
+def _append_legacy_reversed_ratio(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add only the legacy reciprocal ratio needed by direct wide conversion."""
+    source = standardize_uploaded_frame(frame)
+    legacy_rows = source[
+        source["指标编码"].astype(str).eq("CORE_CAPITAL_TO_REGISTERED_CAPITAL")
+    ].copy()
+    if legacy_rows.empty:
+        return source
+
+    legacy_values = pd.to_numeric(legacy_rows["数值"], errors="coerce")
+    legacy_rows = legacy_rows[legacy_values.notna() & legacy_values.ne(0)].copy()
+    if legacy_rows.empty:
+        return source
+
+    definition = next(
+        item for item in DERIVED_METRICS
+        if item.code == "REGISTERED_CAPITAL_TO_CORE_CAPITAL"
+    )
+    legacy_rows["数值"] = 1.0 / pd.to_numeric(legacy_rows["数值"], errors="coerce")
+    legacy_rows["指标编码"] = definition.code
+    legacy_rows["指标名称"] = definition.name
+    legacy_rows["一级模块"] = definition.level1
+    legacy_rows["二级模块"] = definition.level2
+    legacy_rows["单位"] = definition.unit
+    legacy_rows["数据类型"] = definition.data_type
+    legacy_rows["指标属性"] = definition.attribute
+    legacy_rows["来源类型"] = "系统计算"
+    legacy_rows["备注"] = "由旧版核心资本/注册资本指标取倒数自动转换"
+    legacy_rows["计算逻辑"] = "1/(核心资本/注册资本)"
+
+    existing = source[
+        source["指标编码"].astype(str).eq(definition.code)
+    ]
+    key_columns = [
+        "报告类型", "公司统一编码", "报告年度", "报告季度",
+        "报告期", "期间口径", "指标编码",
+    ]
+    existing_keys = set(
+        existing[key_columns].fillna("").astype(str).itertuples(index=False, name=None)
+    )
+    candidate_keys = legacy_rows[key_columns].fillna("").astype(str).apply(tuple, axis=1)
+    additions = legacy_rows.loc[~candidate_keys.isin(existing_keys)]
     if additions.empty:
         return source
     return pd.concat([source, additions], ignore_index=True)
@@ -591,7 +650,7 @@ def convert_external_workbook(
 
     lookup = _metric_lookup(taxonomy)
     company_type_map = {str(key).strip(): _company_type(value) for key, value in (company_type_map or {}).items()}
-    output: list[dict] = []
+    output_frames: list[pd.DataFrame] = []
     sheet_rows: list[dict] = []
     mapping_rows: dict[str, dict] = {}
     logic_rows: list[dict] = []
@@ -615,9 +674,16 @@ def convert_external_workbook(
         if unmapped:
             raise ValueError(f"工作表 {sheet_name} 存在未精确映射指标：{', '.join(unmapped)}")
 
-        code_by_column = {column: lookup[canonical_metric_name(column)]["指标编码"] for column in metric_columns}
+        metric_by_column = {
+            column: lookup[canonical_metric_name(column)]
+            for column in metric_columns
+        }
+        code_by_column = {
+            column: metric_by_column[column]["指标编码"]
+            for column in metric_columns
+        }
         for column in metric_columns:
-            metric = lookup[canonical_metric_name(column)]
+            metric = metric_by_column[column]
             mapping_rows.setdefault(column, {
                 "来源字段": column,
                 "匹配方式": "指标名称精确匹配",
@@ -626,25 +692,47 @@ def convert_external_workbook(
 
         failed_logic: dict[str, list[float]] = {item.code: [] for item in DERIVED_METRICS}
         checked_logic: dict[str, int] = {item.code: 0 for item in DERIVED_METRICS}
-        output_start = len(output)
         skipped_values: dict[str, int] = {}
-        for _, row in frame.iterrows():
-            company = str(row["公司"]).strip()
-            peer_group = str(row.get("分类", "")).strip()
+
+        identities: list[dict[str, Any]] = []
+        for row_id, (company_value, peer_value) in enumerate(
+            zip(frame["公司"].tolist(), frame["分类"].tolist())
+        ):
+            company = str(company_value).strip()
             identity = resolve_company_identity(company, company_type_map)
             if identity.company_type == "未分类":
                 unknown_companies.add(company)
+            identities.append({
+                "_row_id": row_id,
+                "公司": identity.standard_name,
+                "原始公司名称": identity.original_name,
+                "标准公司名称": identity.standard_name,
+                "公司统一编码": identity.company_code,
+                "公司类型": identity.company_type,
+                "同业分类": str(peer_value).strip(),
+            })
+
+        numeric_frame = frame[metric_columns].apply(
+            lambda series: series.map(_number)
+        )
+        source_column_by_code: dict[str, str] = {}
+        for column, code in code_by_column.items():
+            source_column_by_code.setdefault(code, column)
+        raw_arrays = {column: frame[column].tolist() for column in metric_columns}
+        for row_id, numeric_values in enumerate(
+            numeric_frame.itertuples(index=False, name=None)
+        ):
             raw_by_code = {
-                code_by_column[column]: _number(row[column])
-                for column in metric_columns
-                if _number(row[column]) is not None
+                code_by_column[column]: value
+                for column, value in zip(metric_columns, numeric_values)
+                if value is not None and not pd.isna(value)
             }
             calculated = calculate_derived_values(raw_by_code)
             for definition in DERIVED_METRICS:
-                source_column = next((column for column, code in code_by_column.items() if code == definition.code), None)
+                source_column = source_column_by_code.get(definition.code)
                 if not source_column:
                     continue
-                actual = row[source_column]
+                actual = raw_arrays[source_column][row_id]
                 expected = calculated.get(definition.code)
                 if expected is None or pd.isna(actual):
                     continue
@@ -662,49 +750,81 @@ def convert_external_workbook(
                         if difference > tolerance:
                             failed_logic[definition.code].append(difference)
 
-            for column in metric_columns:
-                metric = lookup[canonical_metric_name(column)]
-                value = _external_value(row[column], metric)
-                if metric["数据类型"] not in {"文本", "评级", "布尔"} and pd.isna(value):
-                    skipped_values[column] = skipped_values.get(column, 0) + 1
-                    continue
-                if metric["数据类型"] in {"文本", "评级", "布尔"} and value == "":
-                    skipped_values[column] = skipped_values.get(column, 0) + 1
-                    continue
-                output.append({
-                    "公司": identity.standard_name,
-                    "原始公司名称": identity.original_name,
-                    "标准公司名称": identity.standard_name,
-                    "公司统一编码": identity.company_code,
-                    "公司类型": identity.company_type,
-                    "同业分类": peer_group,
-                    "报告类型": report_profile_id,
-                    "报告年度": year,
-                    "报告季度": quarter,
-                    "报告期": report_period,
-                    "披露日期": "",
-                    "一级模块": metric["一级模块"],
-                    "二级模块": metric["二级模块"],
-                    "行次": "",
-                    "指标编码": metric["指标编码"],
-                    "指标名称": metric["指标名称"],
-                    "期间口径": "本季度末数",
-                    "数值": value,
-                    "单位": metric["单位"],
-                    "数据类型": metric["数据类型"],
-                    "是否预测": "否",
-                    "来源页码": "",
-                    "原始披露值": row[column],
-                    "备注": "外部宽表按指标名称精确映射",
-                    "来源类型": "外部数据集",
-                    "指标属性": metric["指标属性"],
-                    "来源文件": filename,
-                    "来源工作表": sheet_name,
-                    "导入批次": f"{Path(filename).stem}:{report_period}",
-                    "计算逻辑": metric["计算逻辑"],
-                })
+        normalized_columns: dict[str, pd.Series] = {}
+        for column in metric_columns:
+            metric = metric_by_column[column]
+            if metric["数据类型"] in {"文本", "评级", "布尔"}:
+                values = frame[column].map(
+                    lambda value: "" if pd.isna(value) else str(value).strip()
+                )
+                valid = values.ne("")
+            else:
+                values = numeric_frame[column].astype(float)
+                if metric["指标编码"] in PERCENT_FROM_RATIO_CODES:
+                    percent_mask = frame[column].astype(str).str.strip().str.endswith(("%", "％"))
+                    values = values.where(percent_mask, values * 100)
+                valid = values.notna()
+            skipped_count = int((~valid).sum())
+            if skipped_count:
+                skipped_values[column] = skipped_count
+            normalized_columns[column] = values
 
-        company_record_count = len(output) - output_start
+        normalized_values = pd.DataFrame(normalized_columns, index=frame.index)
+
+        raw_wide = frame[metric_columns].reset_index(drop=True).copy()
+        raw_wide.insert(0, "_row_id", np.arange(len(raw_wide)))
+        value_wide = normalized_values.reset_index(drop=True).copy()
+        value_wide.insert(0, "_row_id", np.arange(len(value_wide)))
+        raw_long = raw_wide.melt(
+            id_vars="_row_id",
+            value_vars=metric_columns,
+            var_name="_source_column",
+            value_name="原始披露值",
+        )
+        value_long = value_wide.melt(
+            id_vars="_row_id",
+            value_vars=metric_columns,
+            var_name="_source_column",
+            value_name="数值",
+        )
+        value_long["原始披露值"] = raw_long["原始披露值"]
+
+        metric_metadata = pd.DataFrame([
+            {
+                "_source_column": column,
+                "_metric_order": order,
+                **metric_by_column[column],
+            }
+            for order, column in enumerate(metric_columns)
+        ])
+        company_records = (
+            value_long
+            .merge(metric_metadata, on="_source_column", how="left", validate="many_to_one")
+            .merge(pd.DataFrame(identities), on="_row_id", how="left", validate="many_to_one")
+        )
+        text_mask = company_records["数据类型"].isin({"文本", "评级", "布尔"})
+        company_records = company_records.loc[
+            (text_mask & company_records["数值"].ne(""))
+            | (~text_mask & company_records["数值"].notna())
+        ].sort_values(["_row_id", "_metric_order"], kind="stable")
+        company_records["报告类型"] = report_profile_id
+        company_records["报告年度"] = year
+        company_records["报告季度"] = quarter
+        company_records["报告期"] = report_period
+        company_records["披露日期"] = ""
+        company_records["行次"] = ""
+        company_records["期间口径"] = "本季度末数"
+        company_records["是否预测"] = "否"
+        company_records["来源页码"] = ""
+        company_records["备注"] = "外部宽表按指标名称精确映射"
+        company_records["来源类型"] = "外部数据集"
+        company_records["来源文件"] = filename
+        company_records["来源工作表"] = sheet_name
+        company_records["导入批次"] = f"{Path(filename).stem}:{report_period}"
+        company_records = company_records.reindex(columns=STANDARD_COLUMNS)
+        company_record_count = len(company_records)
+        output_frames.append(company_records)
+
         industry_records = _industry_metric_records(
             frame,
             code_by_column,
@@ -716,7 +836,8 @@ def convert_external_workbook(
             quarter=quarter,
             report_period=report_period,
         )
-        output.extend(industry_records)
+        if industry_records:
+            output_frames.append(pd.DataFrame(industry_records, columns=STANDARD_COLUMNS))
 
         for definition in DERIVED_METRICS:
             if checked_logic[definition.code] == 0:
@@ -739,7 +860,7 @@ def convert_external_workbook(
             "公司数": int(frame["公司"].nunique()),
             "指标数": len(metric_columns),
             "源数据单元格数": len(frame) * len(metric_columns),
-            "转换记录数": len(output) - output_start,
+            "转换记录数": company_record_count + len(industry_records),
             "公司转换记录数": company_record_count,
             "行业指标数": len(industry_records),
             "跳过空值或错误值": sum(skipped_values.values()),
@@ -754,24 +875,12 @@ def convert_external_workbook(
     if not logic_frame.empty and (logic_frame["状态"] != "通过").any():
         warnings.append("部分外部派生指标与系统计算逻辑不一致，请在确认集成前查看逻辑校验结果。")
 
-    converted_data = pd.DataFrame(output, columns=STANDARD_COLUMNS)
-    enriched_data = add_missing_derived_metrics(converted_data)
-    reversed_ratio_rows = enriched_data[
-        enriched_data["指标编码"].astype(str).eq(
-            "REGISTERED_CAPITAL_TO_CORE_CAPITAL"
-        )
-    ]
-    if not reversed_ratio_rows.empty:
-        converted_data = pd.concat(
-            [converted_data, reversed_ratio_rows],
-            ignore_index=True,
-        ).drop_duplicates(
-            subset=[
-                "报告类型", "公司统一编码", "报告年度", "报告季度",
-                "报告期", "期间口径", "指标编码",
-            ],
-            keep="first",
-        )
+    converted_data = (
+        pd.concat(output_frames, ignore_index=True)
+        if output_frames
+        else pd.DataFrame(columns=STANDARD_COLUMNS)
+    )
+    converted_data = _append_legacy_reversed_ratio(converted_data)
     return ExternalConversionResult(
         data=converted_data,
         sheet_summary=pd.DataFrame(sheet_rows),
