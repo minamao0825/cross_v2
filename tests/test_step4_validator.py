@@ -79,6 +79,7 @@ def rules_frame(*rule_ids: str) -> pd.DataFrame:
     definitions = {
         "ACTUAL_CAPITAL_COMPONENTS": ("实际资本等于四类资本之和", 1),
         "DUPLICATE_ACTUAL_CAPITAL": ("实际资本跨表一致性", 1),
+        "DUPLICATE_RECOGNIZED_ASSETS": ("认可资产跨表一致性", 1),
     }
     return pd.DataFrame([
         {
@@ -110,6 +111,23 @@ class Step4ValidatorTests(unittest.TestCase):
         self.assertEqual(row["status"], "未通过")
         self.assertEqual(row["difference"], 3)
 
+    def test_duplicate_recognized_assets_compares_main_and_asset_table(self):
+        main = standard_row("RECOGNIZED_ASSETS", 16526.99169, period="本季度末数")
+        asset = standard_row(
+            "RECOGNIZED_ASSETS",
+            16526.99169,
+            period="期末数",
+            来源工作表="S03-认可资产表",
+        )
+        result = validate_standard_data(
+            pd.DataFrame([main, asset]),
+            rules_frame("DUPLICATE_RECOGNIZED_ASSETS"),
+        )
+        row = result[result["rule_id"] == "DUPLICATE_RECOGNIZED_ASSETS"].iloc[0]
+        self.assertEqual(row["period"], "当前期末")
+        self.assertEqual(row["status"], "通过")
+        self.assertEqual(row["difference"], 0)
+
     def test_business_rules_are_isolated_by_company(self):
         rows = [
             standard_row("ACTUAL_CAPITAL", 100),
@@ -139,6 +157,34 @@ class Step4ValidatorTests(unittest.TestCase):
         self.assertEqual(row["period"], "当前期末")
         self.assertEqual(row["status"], "通过")
 
+    def test_business_rules_ignore_non_current_period_groups(self):
+        rows = [
+            standard_row("ACTUAL_CAPITAL", 100, period="本季度末数"),
+            standard_row("CORE_T1_CAPITAL", 70, period="期末数"),
+            standard_row("CORE_T2_CAPITAL", 10, period="期末数"),
+            standard_row("ANC_T1_CAPITAL", 15, period="期末数"),
+            standard_row("ANC_T2_CAPITAL", 5, period="期末数"),
+            standard_row("ACTUAL_CAPITAL", 999, period="上季度末数"),
+            standard_row("CORE_T1_CAPITAL", 1, period="期初数"),
+            standard_row("CORE_T2_CAPITAL", 1, period="期初数"),
+            standard_row("ANC_T1_CAPITAL", 1, period="期初数"),
+            standard_row("ANC_T2_CAPITAL", 1, period="期初数"),
+            standard_row("ACTUAL_CAPITAL", 888, period="本年累计数"),
+            standard_row("CORE_T1_CAPITAL", 1, period="本年累计数"),
+            standard_row("CORE_T2_CAPITAL", 1, period="本年累计数"),
+            standard_row("ANC_T1_CAPITAL", 1, period="本年累计数"),
+            standard_row("ANC_T2_CAPITAL", 1, period="本年累计数"),
+        ]
+        result = validate_standard_data(
+            pd.DataFrame(rows),
+            rules_frame("ACTUAL_CAPITAL_COMPONENTS"),
+        )
+        business = result[result["rule_id"] == "ACTUAL_CAPITAL_COMPONENTS"]
+
+        self.assertEqual(len(business), 1)
+        self.assertEqual(business.iloc[0]["period"], "当前期末")
+        self.assertEqual(business.iloc[0]["status"], "通过")
+
     def test_schema_checks_detect_unit_period_and_unknown_code(self):
         rows = [
             standard_row("ACTUAL_CAPITAL", 100, 单位="元"),
@@ -159,6 +205,57 @@ class Step4ValidatorTests(unittest.TestCase):
         self.assertIn("SCHEMA_ALLOWED_PERIOD", failed_ids)
         self.assertIn("SCHEMA_KNOWN_METRIC", failed_ids)
 
+    def test_system_derived_metrics_are_registered_for_schema_validation(self):
+        derived = standard_row("ACTUAL_CAPITAL", 1)
+        derived.update({
+            "指标编码": "ACTUAL_CAPITAL_TO_RECOGNIZED_ASSETS",
+            "指标名称": "实际资本/认可资产",
+            "数值": 0.1,
+            "单位": "倍",
+            "数据类型": "比率",
+            "来源类型": "系统计算",
+            "指标属性": "计算",
+        })
+
+        result = validate_standard_data(
+            pd.DataFrame([derived]),
+            pd.DataFrame(),
+            taxonomy_frame(),
+        )
+
+        known = result[result["rule_id"] == "SCHEMA_KNOWN_METRIC"].iloc[0]
+        self.assertEqual(known["status"], "通过")
+        self.assertEqual(known["actual"], 0)
+
+    def test_blank_unit_is_allowed_only_when_metric_dictionary_has_no_unit(self):
+        text_metric = standard_row("ACTUAL_CAPITAL", "(20%,35%]")
+        text_metric.update({
+            "指标编码": "POLICY_SURPLUS_CORE_BAND",
+            "指标名称": "保单未来盈余/核心资本分布",
+            "单位": "",
+            "数据类型": "文本",
+            "来源类型": "系统计算",
+            "指标属性": "计算",
+        })
+        amount_metric = standard_row("ACTUAL_CAPITAL", 100, 单位="")
+
+        text_result = validate_standard_data(
+            pd.DataFrame([text_metric]),
+            pd.DataFrame(),
+            taxonomy_frame(),
+        )
+        amount_result = validate_standard_data(
+            pd.DataFrame([amount_metric]),
+            pd.DataFrame(),
+            taxonomy_frame(),
+        )
+
+        text_required = text_result[text_result["rule_id"].eq("SCHEMA_REQUIRED_FIELDS")].iloc[0]
+        amount_required = amount_result[amount_result["rule_id"].eq("SCHEMA_REQUIRED_FIELDS")].iloc[0]
+        self.assertEqual(text_required["status"], "通过")
+        self.assertEqual(amount_required["status"], "未通过")
+        self.assertIn("单位缺失1条", amount_required["notes"])
+
     def test_completeness_reports_each_missing_core_metric(self):
         rows = [
             standard_row(code, 100 if data_type == "金额" else 200)
@@ -178,6 +275,28 @@ class Step4ValidatorTests(unittest.TestCase):
             "REQUIRED_CORE_METRIC:CORE_SOLVENCY_RATIO"
         ])
         self.assertEqual(missing.iloc[0]["status"], "缺失")
+
+    def test_completeness_checks_only_current_period_group(self):
+        rows = [
+            standard_row(code, 100 if data_type == "金额" else 200)
+            for code, _name, _unit, data_type in CORE_METRICS
+        ]
+        rows.extend([
+            standard_row("ACTUAL_CAPITAL", 90, period="上季度末数"),
+            standard_row("ACTUAL_CAPITAL", 110, period="下季度末预测数"),
+        ])
+        result = validate_standard_data(
+            pd.DataFrame(rows),
+            pd.DataFrame(),
+            taxonomy_frame(),
+        )
+        completeness = result[
+            result["rule_id"].astype(str).str.startswith("REQUIRED_CORE_METRIC:")
+        ]
+
+        self.assertEqual(len(completeness), len(CORE_METRICS))
+        self.assertEqual(set(completeness["period"]), {"当前期末"})
+        self.assertEqual(set(completeness["status"]), {"通过"})
 
     def test_conflicting_values_in_same_source_are_rejected(self):
         rows = [

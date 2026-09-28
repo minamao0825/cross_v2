@@ -7,6 +7,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from .solvency_metric_registry import extend_taxonomy
 from .solvency_normalizer import STANDARD_COLUMNS
 
 
@@ -14,7 +15,7 @@ EXTRA_VALIDATION_RULES = [
     {
         "规则ID": "DUPLICATE_ACTUAL_CAPITAL",
         "规则名称": "实际资本跨表一致性",
-        "适用期间": "本季度末数|上季度末数|下季度末预测数|下季度预测数|期末数|期初数",
+        "适用期间": "本季度末数|期末数|本季度（末）数",
         "容差": 1,
         "容差单位": "万元",
         "启用": "是",
@@ -23,11 +24,20 @@ EXTRA_VALIDATION_RULES = [
     {
         "规则ID": "DUPLICATE_MINIMUM_CAPITAL",
         "规则名称": "最低资本跨表一致性",
-        "适用期间": "本季度末数|上季度末数|下季度末预测数|下季度预测数|期末数|期初数",
+        "适用期间": "本季度末数|期末数|本季度（末）数",
         "容差": 1,
         "容差单位": "万元",
         "启用": "是",
         "规则说明": "主要指标表与最低资本表披露的最低资本应一致",
+    },
+    {
+        "规则ID": "DUPLICATE_RECOGNIZED_ASSETS",
+        "规则名称": "认可资产跨表一致性",
+        "适用期间": "本季度末数|期末数|本季度（末）数",
+        "容差": 1,
+        "容差单位": "万元",
+        "启用": "是",
+        "规则说明": "主要指标表与认可资产表披露的认可资产应一致",
     },
 ]
 
@@ -44,7 +54,7 @@ PERIOD_GROUP_ALIASES: dict[str, tuple[str, ...]] = {
     "上季度": ("上季度数",),
     "本年累计": ("本年累计数", "年度累计数"),
 }
-PERIOD_GROUP_ORDER = {name: index for index, name in enumerate(PERIOD_GROUP_ALIASES)}
+CURRENT_PERIOD_GROUP = "当前期末"
 PERIOD_ALIAS_TO_GROUP = {
     alias: group
     for group, aliases in PERIOD_GROUP_ALIASES.items()
@@ -105,6 +115,7 @@ RULE_METRICS: dict[str, tuple[str, ...]] = {
     ),
     "DUPLICATE_ACTUAL_CAPITAL": ("ACTUAL_CAPITAL",),
     "DUPLICATE_MINIMUM_CAPITAL": ("MINIMUM_CAPITAL",),
+    "DUPLICATE_RECOGNIZED_ASSETS": ("RECOGNIZED_ASSETS",),
 }
 
 
@@ -274,7 +285,11 @@ def _evaluate_business_rule(
             ("QUANT_RISK_CAPITAL", "CONTROL_RISK_CAPITAL", "ADDITIONAL_CAPITAL"),
             period_group,
         )
-    if rule_id in {"DUPLICATE_ACTUAL_CAPITAL", "DUPLICATE_MINIMUM_CAPITAL"}:
+    if rule_id in {
+        "DUPLICATE_ACTUAL_CAPITAL",
+        "DUPLICATE_MINIMUM_CAPITAL",
+        "DUPLICATE_RECOGNIZED_ASSETS",
+    }:
         values = _metric_values(frame, RULE_METRICS[rule_id][0], period_group)
         if len(values) < 2:
             return None, None
@@ -369,15 +384,28 @@ def _schema_checks(group: pd.DataFrame, taxonomy: pd.DataFrame) -> list[Validati
     )
     taxonomy_by_code = taxonomy_frame.set_index("指标编码", drop=False)
 
+    codes = group["指标编码"].fillna("").astype(str).str.strip()
     required_fields = (
         "公司", "标准公司名称", "公司统一编码", "公司类型", "同业分类",
         "报告类型", "报告年度", "报告季度", "报告期", "指标编码",
-        "指标名称", "期间口径", "单位", "数据类型",
+        "指标名称", "期间口径", "数据类型",
     )
     missing_by_field = {
         field: int(group[field].fillna("").astype(str).str.strip().eq("").sum())
         for field in required_fields
     }
+    expected_units = codes.map(
+        lambda code: str(taxonomy_by_code.loc[code].get("标准单位", "")).strip()
+        if code in taxonomy_by_code.index else ""
+    )
+    missing_units = int(
+        (
+            group["单位"].fillna("").astype(str).str.strip().eq("")
+            & expected_units.ne("")
+        ).sum()
+    )
+    if missing_units:
+        missing_by_field["单位"] = missing_units
     missing_by_field = {field: count for field, count in missing_by_field.items() if count}
     missing_total = sum(missing_by_field.values())
     results.append(_result(
@@ -391,7 +419,6 @@ def _schema_checks(group: pd.DataFrame, taxonomy: pd.DataFrame) -> list[Validati
         suggestion="返回 Step3 补齐公司、报告期或指标元数据。" if missing_total else "",
     ))
 
-    codes = group["指标编码"].fillna("").astype(str).str.strip()
     unknown_rows = group.loc[~codes.isin(taxonomy_by_code.index)]
     results.append(_result(
         check_type="数据规范", severity="错误", rule_id="SCHEMA_KNOWN_METRIC",
@@ -511,12 +538,7 @@ def _completeness_checks(group: pd.DataFrame, taxonomy: pd.DataFrame) -> list[Va
         .set_index("指标编码")["指标名称"].astype(str).to_dict()
     )
     present_groups = {str(value).strip() for value in group["_验证期间组"] if str(value).strip()}
-    core_rows = group[group["指标编码"].astype(str).isin(REQUIRED_CORE_METRICS)]
-    core_groups = set(core_rows["_验证期间组"].astype(str))
-    target_groups: list[str] = ["当前期末"] if present_groups else []
-    for period_group in ("上期末/期初", "下季度预测"):
-        if period_group in core_groups:
-            target_groups.append(period_group)
+    target_groups: list[str] = [CURRENT_PERIOD_GROUP] if present_groups else []
 
     for period_group in target_groups:
         for code in REQUIRED_CORE_METRICS:
@@ -537,10 +559,10 @@ def _completeness_checks(group: pd.DataFrame, taxonomy: pd.DataFrame) -> list[Va
 
 def _business_checks(group: pd.DataFrame, rules: pd.DataFrame) -> list[ValidationResult]:
     results: list[ValidationResult] = []
-    periods = list(dict.fromkeys(
+    present_periods = {
         str(value).strip() for value in group["_验证期间组"] if str(value).strip()
-    ))
-    periods.sort(key=lambda value: (PERIOD_GROUP_ORDER.get(value, 999), value))
+    }
+    periods = [CURRENT_PERIOD_GROUP] if CURRENT_PERIOD_GROUP in present_periods else []
     for _, rule in rules.iterrows():
         rule_id = str(rule.get("规则ID", "")).strip()
         if rule_id not in RULE_METRICS or str(rule.get("启用", "是")).strip() == "否":
@@ -598,6 +620,8 @@ def validate_standard_data(
         return pd.DataFrame(columns=RESULT_COLUMNS)
     rule_frame = rules if isinstance(rules, pd.DataFrame) else pd.DataFrame()
     taxonomy_frame = taxonomy if isinstance(taxonomy, pd.DataFrame) else pd.DataFrame()
+    if not taxonomy_frame.empty:
+        taxonomy_frame = extend_taxonomy(taxonomy_frame)
     results: list[ValidationResult] = []
     for group in _entity_groups(frame):
         if not taxonomy_frame.empty:

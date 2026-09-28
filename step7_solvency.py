@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import colorsys
+import re
 from collections.abc import Callable, Iterable
 from datetime import date
 from html import escape
@@ -11,6 +12,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from services.solvency_dataset_adapter import POLICY_SURPLUS_COMPONENT_CODES, canonical_period_scope
 from dashboard_components import (
     company_detail_rows,
     render_key_solvency_overview,
@@ -23,6 +25,7 @@ from dashboard_components import (
 )
 from services.llm_config import model_request_parameters, normalize_model_id
 from services.llm_http import post_json_with_retry
+from services.solvency_company_identity import display_company_names
 from services.solvency_navigation import (
     COMPANY_NAVIGATION,
     CREDIT_RISK_ASSET_SCATTER,
@@ -55,6 +58,7 @@ from services.solvency_step7_chart_plans import (
     KEY_METRICS_TABLE,
     MARKET_CREDIT_MATRIX,
     PENDING_DEFINITION,
+    QUALITY_AND_CAPITAL,
     RISK_RATIO_SCATTER,
     SINGLE_METRIC_TREND,
     SOLVENCY_MATRIX,
@@ -79,14 +83,33 @@ from services.solvency_step7_charts import (
     build_single_metric_trend_chart,
     build_single_metric_trend_charts,
     build_solvency_ratio_combo_chart,
+    convert_multiple_units_to_percent,
     component_stack_axis_domain,
     component_stack_proportion_axis_domain,
     metric_bar_axis_domain,
+    report_period_combo_bar_color_map,
     report_period_color_map,
     risk_ratio_scatter_default_domain,
     solvency_ratio_axis_domain,
 )
 from services.solvency_report_notes import company_notes_template
+from services.solvency_step7_quality import (
+    ANC_COMPONENTS,
+    COMPONENT_COLORS,
+    SCOPE_LABELS,
+    GREY,
+    anc_pie_figure,
+    combo_figure,
+    complete_external_capital_detail_zeros,
+    core_omitted_nonzero,
+    core_waterfall_figure,
+    capital_value,
+    has_values,
+    period_scopes,
+    radar_figure,
+    value_for,
+)
+from services.solvency_step7_quality_charts import company_quality_chart, empty_company_chart
 
 
 PICTURE_DIR = Path(__file__).resolve().parent / "picture"
@@ -96,6 +119,8 @@ DEFAULT_SORT_LABEL = "默认（按列表原始顺序）"
 SORT_DESCENDING = "降序（从大到小）"
 SORT_ASCENDING = "升序（从小到大）"
 TRACKED_COMPANY_COLOR = "#00338D"
+RISK_DIVERSIFICATION_EFFECT_COLOR = KPMG_BRIGHT_CHART_COLORS[6]
+OVERSEAS_FIXED_INCOME_RISK_COLOR = "#F68D2E"
 RISK_SCATTER_DISPLAY_WIDTH = 750
 RISK_SCATTER_FULL_PANEL_WIDTH = 570
 RISK_SCATTER_ZOOM_PANEL_WIDTH = 330
@@ -147,21 +172,32 @@ COMPONENT_STACK_SPECS: dict[str, tuple[tuple[str, str, str], ...]] = {
         ("LOSS_OCCURRENCE_RISK_CAPITAL", "损失发生风险", KPMG_BRIGHT_CHART_COLORS[0]),
         ("SURRENDER_RISK_CAPITAL", "退保风险", KPMG_BRIGHT_CHART_COLORS[1]),
         ("EXPENSE_RISK_CAPITAL", "费用风险", KPMG_BRIGHT_CHART_COLORS[2]),
-        ("LIFE_INSURANCE_RISK_DIVERSIFICATION_EFFECT", "风险分散效应", KPMG_BRIGHT_CHART_COLORS[3]),
+        ("LIFE_INSURANCE_RISK_DIVERSIFICATION_EFFECT", "风险分散效应", RISK_DIVERSIFICATION_EFFECT_COLOR),
     ),
     "各类市场风险占比": (
         ("INTEREST_RATE_RISK_CAPITAL", "利率风险", KPMG_BRIGHT_CHART_COLORS[0]),
         ("EQUITY_RISK_CAPITAL", "权益价格风险", KPMG_BRIGHT_CHART_COLORS[1]),
         ("REAL_ESTATE_RISK_CAPITAL", "房地产价格风险", KPMG_BRIGHT_CHART_COLORS[2]),
-        ("OVERSEAS_FIXED_INCOME_RISK_CAPITAL", "境外固定收益类资产价格风险", KPMG_BRIGHT_CHART_COLORS[3]),
+        ("OVERSEAS_FIXED_INCOME_RISK_CAPITAL", "境外固定收益类资产价格风险", OVERSEAS_FIXED_INCOME_RISK_COLOR),
         ("OVERSEAS_EQUITY_RISK_CAPITAL", "境外权益类资产价格风险", KPMG_BRIGHT_CHART_COLORS[4]),
         ("FOREIGN_EXCHANGE_RISK_CAPITAL", "汇率风险", KPMG_BRIGHT_CHART_COLORS[5]),
-        ("MARKET_RISK_DIVERSIFICATION_EFFECT", "风险分散效应", KPMG_BRIGHT_CHART_COLORS[6]),
+        ("MARKET_RISK_DIVERSIFICATION_EFFECT", "风险分散效应", RISK_DIVERSIFICATION_EFFECT_COLOR),
     ),
     "各类信用风险占比": (
         ("SPREAD_RISK_CAPITAL", "利差风险", KPMG_BRIGHT_CHART_COLORS[0]),
         ("COUNTERPARTY_RISK_CAPITAL", "交易对手违约风险", KPMG_BRIGHT_CHART_COLORS[1]),
-        ("CREDIT_RISK_DIVERSIFICATION_EFFECT", "风险分散效应", KPMG_BRIGHT_CHART_COLORS[2]),
+        ("CREDIT_RISK_DIVERSIFICATION_EFFECT", "风险分散效应", RISK_DIVERSIFICATION_EFFECT_COLOR),
+    ),
+    "认可资产构成": (
+        ("CASH_LIQUID_ASSETS", "现金及流动性管理工具", KPMG_BRIGHT_CHART_COLORS[0]),
+        ("INVESTMENT_ASSETS", "投资资产", KPMG_BRIGHT_CHART_COLORS[1]),
+        ("SUBSIDIARY_JV_ASSOCIATE_EQUITY", "在子公司合营企业和联营企业中的权益", KPMG_BRIGHT_CHART_COLORS[2]),
+        ("REINSURANCE_ASSETS", "再保险资产", KPMG_BRIGHT_CHART_COLORS[3]),
+        ("RECEIVABLES_AND_PREPAYMENTS", "应收及预付款项", KPMG_BRIGHT_CHART_COLORS[4]),
+        ("FIXED_ASSETS", "固定资产", KPMG_BRIGHT_CHART_COLORS[5]),
+        ("LAND_USE_RIGHTS", "土地使用权", KPMG_BRIGHT_CHART_COLORS[6]),
+        ("SEPARATE_ACCOUNT_ASSETS", "独立账户资产", KPMG_BRIGHT_CHART_COLORS[7]),
+        ("OTHER_RECOGNIZED_ASSETS", "其他认可资产", KPMG_BRIGHT_CHART_COLORS[8]),
     ),
 }
 
@@ -176,8 +212,10 @@ QUANT_RISK_STACK_RATIO_CODES = {
 
 COMPONENT_STACK_DENOMINATOR_CODES = {
     "量化风险最低资本构成": "QUANT_RISK_CAPITAL",
+    "各类保险风险（寿）占比": "INSURANCE_RISK_CAPITAL",
     "各类市场风险占比": "MARKET_RISK_CAPITAL",
     "各类信用风险占比": "CREDIT_RISK_CAPITAL",
+    "认可资产构成": "RECOGNIZED_ASSETS",
 }
 
 RISK_RATIO_SCATTER_SPECS = {
@@ -502,6 +540,13 @@ def _report_style() -> None:
             border:1px solid #EAEAEA!important; border-radius:0!important;
             padding:14px 4px 2px!important; box-shadow:none!important;
             box-sizing:border-box!important;
+        }
+        [class*="st-key-annual_company_grid_"] [data-testid="stHorizontalBlock"] {
+            flex-wrap:nowrap!important;
+        }
+        [class*="st-key-annual_company_grid_"] [data-testid="stColumn"] {
+            min-width:0!important;
+            flex:1 1 0!important;
         }
         .annual-company-title {
             color:#00338D; font-size:13px; font-weight:700; line-height:1.25;
@@ -939,10 +984,179 @@ def _ai_analysis_for_latest_period(
         return f"AI 分析失败：{exc}", True
 
 
+def _unavailable_metric_details(
+    frame: pd.DataFrame,
+    code: str,
+    periods: Iterable[str],
+) -> list[tuple[str, str, str]]:
+    if frame is None or frame.empty or code not in {
+        "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",
+        "POLICY_SURPLUS_TO_INSURANCE_LIABILITIES",
+    }:
+        return []
+    scoped = filter_analysis_frame(frame, metric_code=code, periods=periods)
+    if scoped.empty:
+        return []
+    values = pd.to_numeric(scoped["数值"], errors="coerce")
+    states = scoped["披露状态"].fillna("").astype(str).str.strip()
+    scoped = scoped[values.isna() & states.eq("无法计算")].copy()
+    if scoped.empty:
+        return []
+    details: list[tuple[str, str, str]] = []
+    for _, row in scoped.drop_duplicates(["公司", "报告期"], keep="last").iterrows():
+        reason = str(row.get("备注", "") or "计算依赖不足").strip()
+        reason = re.sub(r"^无法计算[：:]?\s*", "", reason) or "计算依赖不足"
+        details.append((str(row.get("公司", "")).strip(), str(row.get("报告期", "")).strip(), reason))
+    return details
+
+
+def _policy_surplus_coverage_note(source: pd.DataFrame, ratio_rows: pd.DataFrame) -> str:
+    """Describe the numerator's disclosed capital levels for the plotted periods."""
+    if source.empty or ratio_rows.empty:
+        return ""
+    pairs = {(str(row["公司"]), str(row["报告期"])) for _, row in ratio_rows.iterrows()}
+    components = source.loc[
+        source["指标编码"].astype(str).isin(POLICY_SURPLUS_COMPONENT_CODES)
+        & source["期间口径"].map(canonical_period_scope).eq("本季度末数")
+    ]
+    labels = ("核心一级", "核心二级", "附属一级", "附属二级")
+    by_kind: dict[str, dict[str, list[str]]] = {"core": {}, "all": {}, "partial": {}}
+    partial_levels: dict[tuple[str, str], list[str]] = {}
+    for (company, period), group in components.groupby(["公司", "报告期"], sort=False):
+        company, period = str(company), str(period)
+        if (company, period) not in pairs:
+            continue
+        available: dict[str, tuple[float, str]] = {}
+        for code, rows in group.groupby("指标编码", sort=False):
+            rows = rows.loc[~rows.get("来源类型", pd.Series("", index=rows.index)).fillna("").astype(str).eq("宽表空白推定")]
+            rows = rows.loc[~rows.get("披露状态", pd.Series("", index=rows.index)).fillna("").astype(str).isin({"未披露", "不适用", "无法计算"})]
+            numeric = pd.to_numeric(rows["数值"], errors="coerce").dropna()
+            if len(numeric.unique()) == 1:
+                selected = rows.loc[numeric.index[0]]
+                available[str(code)] = (float(numeric.iloc[0]), str(selected.get("披露状态", "")))
+        if not available:
+            continue
+        core = POLICY_SURPLUS_COMPONENT_CODES[0]
+        others = POLICY_SURPLUS_COMPONENT_CODES[1:]
+        only_core = core in available and (
+            not any(code in available for code in others)
+            or (all(code in available and available[code][0] == 0 for code in others)
+                and not any(available[code][1] in {"已披露为0", "disclosed_zero"} for code in others))
+        )
+        if only_core:
+            kind = "core"
+        elif all(code in available for code in POLICY_SURPLUS_COMPONENT_CODES):
+            kind = "all"
+        else:
+            kind = "partial"
+            partial_levels[(company, period)] = [
+                label for code, label in zip(POLICY_SURPLUS_COMPONENT_CODES, labels) if code in available
+            ]
+        by_kind[kind].setdefault(company, []).append(period)
+
+    def company_list(kind: str) -> str:
+        names = []
+        for company, periods in by_kind[kind].items():
+            selected = {period for name, period in pairs if name == company}
+            suffix = "" if set(periods) == selected else f"（{'、'.join(sort_report_periods(periods))}）"
+            names.append(company + suffix)
+        return "、".join(names)
+
+    notes = []
+    if by_kind["core"]:
+        notes.append(f"{company_list('core')}：分子仅计入核心一级资本的保单未来盈余，其余三个资本层级未披露")
+    if by_kind["all"]:
+        notes.append(f"{company_list('all')}：分子计入四类保单未来盈余")
+    for company, periods in by_kind["partial"].items():
+        for period in sort_report_periods(periods):
+            included = partial_levels[(company, period)]
+            notes.append(f"{company}（{period}）：分子计入已披露的{'、'.join(included)}保单未来盈余")
+    return "；".join(notes)
+
+
+def _core_policy_surplus_coverage_note(source: pd.DataFrame, ratio_rows: pd.DataFrame) -> str:
+    """Describe whether the core-capital ratio uses core T1 only or both core levels."""
+    if source.empty or ratio_rows.empty:
+        return ""
+    pairs = {(str(row["公司"]), str(row["报告期"])) for _, row in ratio_rows.iterrows()}
+    components = source.loc[
+        source["指标编码"].astype(str).isin(POLICY_SURPLUS_COMPONENT_CODES)
+        & source["期间口径"].map(canonical_period_scope).eq("本季度末数")
+    ]
+    by_kind: dict[str, dict[str, list[str]]] = {"core_t1": {}, "both": {}, "partial": {}}
+    for (company, period), group in components.groupby(["公司", "报告期"], sort=False):
+        company, period = str(company), str(period)
+        if (company, period) not in pairs:
+            continue
+        available: dict[str, tuple[float, str]] = {}
+        for code, rows in group.groupby("指标编码", sort=False):
+            rows = rows.loc[~rows.get("来源类型", pd.Series("", index=rows.index)).fillna("").astype(str).eq("宽表空白推定")]
+            rows = rows.loc[~rows.get("披露状态", pd.Series("", index=rows.index)).fillna("").astype(str).isin({"未披露", "不适用", "无法计算"})]
+            numeric = pd.to_numeric(rows["数值"], errors="coerce").dropna()
+            if len(numeric.unique()) == 1:
+                selected = rows.loc[numeric.index[0]]
+                available[str(code)] = (float(numeric.iloc[0]), str(selected.get("披露状态", "")))
+
+        core_t1, core_t2 = POLICY_SURPLUS_COMPONENT_CODES[:2]
+        ancillary = POLICY_SURPLUS_COMPONENT_CODES[2:]
+        if core_t1 not in available and core_t2 not in available:
+            continue
+        core_t2_is_explicit_zero = (
+            core_t2 in available
+            and available[core_t2][1] in {"已披露为0", "disclosed_zero"}
+        )
+        ancillary_has_value = any(
+            code in available and available[code][0] != 0 for code in ancillary
+        )
+        core_t1_only = core_t1 in available and (
+            core_t2 not in available
+            or (
+                available[core_t2][0] == 0
+                and not core_t2_is_explicit_zero
+                and not ancillary_has_value
+            )
+        )
+        if core_t1_only:
+            kind = "core_t1"
+        elif core_t1 in available and core_t2 in available:
+            kind = "both"
+        else:
+            kind = "partial"
+        by_kind[kind].setdefault(company, []).append(period)
+
+    def company_list(kind: str) -> str:
+        names = []
+        for company, company_periods in by_kind[kind].items():
+            selected = {period for name, period in pairs if name == company}
+            suffix = (
+                "" if set(company_periods) == selected
+                else f"（{'、'.join(sort_report_periods(company_periods))}）"
+            )
+            names.append(company + suffix)
+        return "、".join(names)
+
+    notes: list[str] = []
+    if by_kind["core_t1"]:
+        notes.append(
+            f"{company_list('core_t1')}：分子仅计入核心一级资本的保单未来盈余，"
+            "核心二级资本没有披露这个明细"
+        )
+    if by_kind["both"]:
+        notes.append(
+            f"{company_list('both')}：分子计入核心一级及核心二级资本的保单未来盈余"
+        )
+    if by_kind["partial"]:
+        notes.append(
+            f"{company_list('partial')}：仅披露核心二级资本的保单未来盈余"
+        )
+    return "；".join(notes)
+
+
 def _render_report_metric(
     frame: pd.DataFrame,
     code: str,
     *,
+    status_frame: pd.DataFrame | None = None,
     periods: list[str],
     show_labels: bool,
     decimals: int,
@@ -955,11 +1169,44 @@ def _render_report_metric(
     company_panels: bool = False,
     company_period_bars: bool = False,
 ) -> None:
+    unavailable = _unavailable_metric_details(
+        status_frame if status_frame is not None else frame,
+        code,
+        periods,
+    )
+    unavailable_companies = list(dict.fromkeys(company for company, _, _ in unavailable))
+    unavailable_legend = (
+        [("#B8BDC7", "无法计算：" + "、".join(unavailable_companies), "square")]
+        if unavailable_companies
+        else []
+    )
+    if unavailable:
+        reason_text = "；".join(
+            f"{company}（{period}）：{reason}"
+            for company, period, reason in unavailable
+        )
+        st.caption("注：无法计算原因——" + reason_text)
     metric_frame = filter_analysis_frame(frame, metric_code=code, periods=periods)
     if metric_frame.empty:
-        st.caption(f"{_metric_title(frame, code)}：当前筛选范围无数据。")
+        if unavailable_legend:
+            _render_chart_legend(unavailable_legend)
+        st.caption(f"{_metric_title(status_frame if status_frame is not None else frame, code)}：当前筛选范围没有可计算数据。")
         return
+    coverage_note = ""
+    if code in {
+        "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",
+        "POLICY_SURPLUS_TO_INSURANCE_LIABILITIES",
+    }:
+        coverage_source = status_frame if status_frame is not None else frame
+        coverage_note = (
+            _core_policy_surplus_coverage_note(coverage_source, metric_frame)
+            if code == "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL"
+            else _policy_surplus_coverage_note(coverage_source, metric_frame)
+        )
+        if coverage_note:
+            st.caption("注：保单未来盈余计算口径——" + coverage_note + "。")
     metric_frame = _convert_unit(metric_frame, unit_mode)
+    metric_frame = convert_multiple_units_to_percent(metric_frame)
     metric_name = str(metric_frame.iloc[0]["指标名称"])
     st.caption(
         f"公司 {metric_frame['公司'].nunique()} 家　｜　"
@@ -1006,6 +1253,7 @@ def _render_report_metric(
             legend_items.append(("#B8BDC7", "特定追踪公司", "outline"))
         if disclosed_count < expected_count:
             legend_items.append(("#B8BDC7", "未披露", "square"))
+        legend_items.extend(unavailable_legend)
         if code in {"CORE_SOLVENCY_RATIO", "COMBINED_SOLVENCY_RATIO"}:
             legend_items.append(("#ED2124", "监管下限", "dash"))
         _render_chart_legend(legend_items)
@@ -1026,6 +1274,7 @@ def _render_report_metric(
         external_legend = []
         if disclosed_count < expected_count:
             external_legend.append(("#B8BDC7", "未披露", "square"))
+        external_legend.extend(unavailable_legend)
         if code in {"CORE_SOLVENCY_RATIO", "COMBINED_SOLVENCY_RATIO"}:
             external_legend.append(("#ED2124", "监管下限", "dash"))
         if external_legend:
@@ -1044,8 +1293,14 @@ def _render_report_metric(
             )
         for group_index, chart in enumerate(charts, start=1):
             with st.container(key=f"s7_trend_group_{key_prefix}_{code}_{group_index}"):
+                rendered_chart = _chart_without_internal_title(chart)
+                if code in {
+                    "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",
+                    "POLICY_SURPLUS_TO_INSURANCE_LIABILITIES",
+                }:
+                    rendered_chart = rendered_chart.properties(height=280)
                 st.altair_chart(
-                    _chart_without_internal_title(chart),
+                    rendered_chart,
                     width="stretch",
                     key=f"{key_prefix}_{code}_trend_{group_index}",
                 )
@@ -1061,7 +1316,7 @@ def _render_report_metric(
             _render_chart_legend([
                 (period_colors[period], period, "square")
                 for period in ordered_periods
-            ])
+            ] + unavailable_legend)
             _render_company_chart_grid(
                 metric_frame,
                 lambda company_frame: build_company_period_bar_chart(
@@ -1075,8 +1330,6 @@ def _render_report_metric(
                 key_prefix=f"{key_prefix}_{code}_period_bars",
                 highlight_company=highlight_company,
             )
-
-
 def _render_chart_legend(items: Iterable[tuple[str, str, str]]) -> None:
     legend_html = "".join(
         (
@@ -1099,9 +1352,11 @@ def _render_company_chart_grid(
     key_prefix: str,
     highlight_company: str = "无",
     panel_width: int | None = None,
+    selected_companies: list[str] | None = None,
+    panel_renderer: Callable[[str], None] | None = None,
 ) -> None:
     """Render equal company panels in one page-width row without scrolling."""
-    companies = _ordered_companies(frame)
+    companies = selected_companies if selected_companies is not None else _ordered_companies(frame)
     if not companies:
         st.warning("当前筛选范围没有可绘制的公司数据。")
         return
@@ -1141,11 +1396,14 @@ def _render_company_chart_grid(
                         f"style='font-size:{title_font_size}px'>{escape(company)}</div>",
                         unsafe_allow_html=True,
                     )
-                    st.altair_chart(
-                        _chart_without_internal_title(chart),
-                        width="stretch",
-                        key=f"{key_prefix}_{index}",
-                    )
+                    if panel_renderer is not None:
+                        panel_renderer(company)
+                    else:
+                        st.altair_chart(
+                            _chart_without_internal_title(chart),
+                            width="stretch",
+                            key=f"{key_prefix}_{index}",
+                        )
 
 
 def _chart_without_internal_title(chart: object) -> object:
@@ -1265,7 +1523,7 @@ def _render_capital_efficiency_bubble_fragment(
     except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
         overlap_error = str(exc)
     st.caption(
-        f"展示 {latest_period}：横轴为实际资本/认可资产，纵轴为核心资本/注册资本，"
+        f"展示 {latest_period}：横轴为实际资本/注册资本，纵轴为核心资本/注册资本，"
         "气泡面积代表认可资产规模；浅灰虚线为全样本横纵指标中位数。"
     )
     if overlap_chart is not None:
@@ -1287,9 +1545,6 @@ def _render_capital_efficiency_bubble_fragment(
         )
     if overlap_error:
         st.caption(f"局部放大图暂不可用：{overlap_error}")
-    st.caption(
-        "局部图横纵轴与主图选区实时联动；设置追踪公司后，默认选区会围绕该公司及其邻近公司。"
-    )
 
 
 @st.fragment
@@ -1437,9 +1692,381 @@ def _render_risk_ratio_scatter_fragment(
         )
     if local_error:
         st.caption(f"局部放大图暂不可用：{local_error}")
-    st.caption(
-        "局部图横纵轴与全样本图选区实时联动；设置追踪公司后，默认选区会围绕该公司及其邻近公司。"
+
+
+def _missing_disclosure_note_lines(
+    chart_name: str,
+    companies: list[str],
+    missing_by_company: dict[str, list[str]],
+) -> list[str]:
+    """Collapse repeated disclosure gaps into concise company-group notes."""
+    if chart_name == "综合退保率":
+        grouped_periods: dict[tuple[str, ...], list[str]] = {}
+        for company in companies:
+            missing_periods = missing_by_company.get(company)
+            if missing_periods:
+                key = tuple(sort_report_periods(dict.fromkeys(missing_periods)))
+                grouped_periods.setdefault(key, []).append(company)
+        return [
+            f"注：未披露——{'、'.join(names)}：{'、'.join(periods)}均未披露综合退保率。"
+            for periods, names in grouped_periods.items()
+        ]
+
+    if chart_name == "投资质量六指标雷达图":
+        grouped_metrics: dict[tuple[str, ...], list[str]] = {}
+        for company in companies:
+            metrics = missing_by_company.get(company)
+            if metrics:
+                grouped_metrics.setdefault(tuple(dict.fromkeys(metrics)), []).append(company)
+        notes: list[str] = []
+        for metrics, names in grouped_metrics.items():
+            detail = (
+                "六项投资质量指标均未披露"
+                if len(metrics) == 6
+                else f"未披露{'、'.join(metrics)}"
+            )
+            notes.append(f"注：未披露——{'、'.join(names)}：{detail}。")
+        return notes
+
+    if chart_name == "近三年平均投资收益率与综合投资收益率":
+        affected = [company for company in companies if missing_by_company.get(company)]
+        if not affected:
+            return []
+        return [
+            f"注：未披露——{'、'.join(affected)}部分报告期的近三年平均投资收益率或"
+            "综合投资收益率未披露。"
+        ]
+
+    period_metric_charts = {
+        "签单保费与新业务利润率",
+        "新业务价值与新业务价值率",
+        "累计投资收益率与累计综合投资收益率",
+    }
+    if chart_name in period_metric_charts:
+        grouped: dict[tuple[str, ...], list[str]] = {}
+        for company in companies:
+            details = missing_by_company.get(company)
+            if details:
+                grouped.setdefault(tuple(details), []).append(company)
+
+        notes: list[str] = []
+        for details, names in grouped.items():
+            by_axis: dict[str, list[str]] = {}
+            for detail in details:
+                axis, separator, metric = str(detail).partition("：")
+                if not separator:
+                    axis, metric = "所选期间", str(detail)
+                metric = metric.replace(
+                    "签单保费（无法计算新业务价值率）",
+                    "签单保费（新业务价值率因此无法计算）",
+                )
+                if metric not in by_axis.setdefault(axis, []):
+                    by_axis[axis].append(metric)
+
+            axes_by_metrics: dict[tuple[str, ...], list[str]] = {}
+            for axis, metrics in by_axis.items():
+                axes_by_metrics.setdefault(tuple(metrics), []).append(axis)
+            phrases: list[str] = []
+            for metrics, axes in axes_by_metrics.items():
+                split_axes = [axis.split("·", 1) for axis in axes]
+                same_scope = all(len(parts) == 2 for parts in split_axes) and len({parts[1] for parts in split_axes}) == 1
+                axis_labels = [parts[0] for parts in split_axes] if same_scope else axes
+                phrases.append(f"{'、'.join(axis_labels)}均未披露{'及'.join(metrics)}")
+            notes.append(
+                f"注：未披露——{'、'.join(names)}：{'；'.join(phrases)}。"
+            )
+        return notes
+
+    if chart_name != "附属一级资本明细":
+        return [
+            f"注：未披露——{company}：" + "；".join(missing_by_company[company])
+            for company in companies if company in missing_by_company
+        ]
+
+    grouped: dict[tuple[str, ...], list[str]] = {}
+    fallback: list[str] = []
+    for company in companies:
+        details = missing_by_company.get(company)
+        if not details:
+            continue
+        periods: list[str] = []
+        for detail in details:
+            period, separator, label = str(detail).partition("：")
+            if not separator or label != "附属一级资本明细":
+                fallback.append(f"注：未披露——{company}：" + "；".join(details))
+                periods = []
+                break
+            periods.append(period)
+        if periods:
+            key = tuple(sort_report_periods(dict.fromkeys(periods)))
+            grouped.setdefault(key, []).append(company)
+
+    notes = [
+        f"注：未披露——{'、'.join(names)}：{'、'.join(periods)}均未披露附属一级资本明细。"
+        for periods, names in grouped.items()
+    ]
+    return [*notes, *fallback]
+
+
+def _render_quality_and_capital(
+    frame: pd.DataFrame,
+    chart_name: str,
+    *,
+    periods: list[str],
+    unit_mode: str,
+    highlight_company: str,
+    key_prefix: str,
+    selected_companies: list[str] | None = None,
+) -> None:
+    """Render disclosed values for every selected company, including empty panels."""
+    converted = convert_multiple_units_to_percent(_convert_unit(frame, unit_mode))
+    if chart_name in {"核心一级资本明细", "附属一级资本明细"}:
+        converted = complete_external_capital_detail_zeros(converted)
+    companies = selected_companies if selected_companies is not None else _ordered_companies(converted)
+    periods = sort_report_periods(periods)
+    if not periods:
+        st.info("当前没有可展示的报告期。")
+        return
+    latest = periods[-1]
+    missing_by_company: dict[str, list[str]] = {}
+    invalid_by_company: dict[str, list[str]] = {}
+    figures: dict[str, list[tuple[str, object | None]]] = {}
+    amount_labels = {
+        "SIGNED_PREMIUM": "签单保费",
+        "NEW_BUSINESS_VALUE": "新业务价值",
+        "INVESTMENT_RETURN": "投资收益率",
+    }
+    line_labels = {
+        "NEW_BUSINESS_MARGIN": "新业务利润率",
+        "COMPREHENSIVE_INVESTMENT_RETURN": "综合投资收益率",
+    }
+    combo_specs = {
+        "签单保费与新业务利润率": ("SIGNED_PREMIUM", "NEW_BUSINESS_MARGIN", False, None),
+        "新业务价值与新业务价值率": ("NEW_BUSINESS_VALUE", "SIGNED_PREMIUM", True, None),
+        "累计投资收益率与累计综合投资收益率": ("INVESTMENT_RETURN", "COMPREHENSIVE_INVESTMENT_RETURN", False, "cumulative"),
+        "近三年平均投资收益率与综合投资收益率": ("INVESTMENT_RETURN", "COMPREHENSIVE_INVESTMENT_RETURN", False, "three_year"),
+    }
+    global_axes = None
+    if chart_name in combo_specs:
+        bar_code, line_code, derived, scope = combo_specs[chart_name]
+        global_axes = (
+            [(period, scope) for period in periods]
+            if scope else period_scopes(converted, (bar_code, line_code), periods)
+        )
+        if not scope:
+            kinds = list(dict.fromkeys(kind for _, kind in global_axes))
+            selected_scope = st.selectbox("期间口径", kinds, format_func=SCOPE_LABELS.get,
+                                          key=f"{key_prefix}_scope") if len(kinds) > 1 else kinds[0]
+            global_axes = [(period, selected_scope) for period in periods]
+        ratio_label = "新业务价值率" if derived else line_labels.get(line_code, "")
+        if scope in {"cumulative", "three_year"}:
+            period_colors = report_period_combo_bar_color_map(periods)
+            bar_legend = [(period_colors[period], period, "square") for period in periods]
+            st.caption("柱形展示投资收益率，粉色折线展示综合投资收益率；柱形颜色对应不同报告期。")
+        else:
+            bar_legend = [("#1E49E2", f"{amount_labels[bar_code]}（{unit_mode}，柱形）", "square")]
+        _render_chart_legend([
+            *bar_legend,
+            ("#FD349C", f"{ratio_label}（%，折线）", "line"),
+        ])
+        if derived:
+            st.caption("新业务价值率＝同公司、同报告期、同期间口径的新业务价值 ÷ 签单保费 × 100%。")
+    elif chart_name == "综合退保率":
+        global_axes = period_scopes(converted, ("SURRENDER_RATE",), periods)
+        kinds = list(dict.fromkeys(kind for _, kind in global_axes))
+        selected_scope = st.selectbox("期间口径", kinds, format_func=SCOPE_LABELS.get,
+                                      key=f"{key_prefix}_scope") if len(kinds) > 1 else kinds[0]
+        colors = _company_color_map(companies, highlight_company)
+        missing: dict[str, list[str]] = {}
+        trend_rows: list[dict[str, object]] = []
+        for company in companies:
+            company_frame = converted.loc[converted["公司"].fillna("").astype(str).eq(company)]
+            for period in periods:
+                value = value_for(company_frame, "SURRENDER_RATE", period, selected_scope)
+                if value is None:
+                    missing.setdefault(company, []).append(period)
+                trend_rows.append({
+                    "公司": company,
+                    "报告期": period,
+                    "指标编码": "SURRENDER_RATE",
+                    "指标名称": "综合退保率",
+                    "数值": value,
+                    "单位": "%",
+                    "披露状态": "已披露" if value is not None else "未披露",
+                })
+        fully_missing = [
+            company for company in companies
+            if len(missing.get(company, [])) == len(periods)
+        ]
+        partly_missing = [
+            company for company in companies
+            if company in missing and company not in fully_missing
+        ]
+        disclosure_legend = []
+        if fully_missing:
+            disclosure_legend.append(("#B8BDC7", "未披露：" + "、".join(fully_missing), "square"))
+        if partly_missing:
+            disclosure_legend.append(("#B8BDC7", "部分未披露：" + "、".join(partly_missing), "square"))
+        if disclosure_legend:
+            _render_chart_legend(disclosure_legend)
+        st.caption(f"综合退保率（%）；期间口径：{SCOPE_LABELS[selected_scope]}。每条折线代表一家公司，缺失期间留空。")
+        trend_frame = pd.DataFrame(trend_rows)
+        if not trend_frame.empty and trend_frame["数值"].notna().any():
+            chart = build_single_metric_trend_chart(
+                trend_frame,
+                "SURRENDER_RATE",
+                periods,
+                colors,
+                highlight_company,
+            )
+            st.altair_chart(
+                _chart_without_internal_title(chart),
+                width="stretch",
+                key=f"{key_prefix}_surrender_all",
+            )
+        else:
+            st.info("未披露可绘图数据")
+        for note in _missing_disclosure_note_lines(chart_name, companies, missing):
+            st.caption(note)
+        return
+    elif chart_name == "核心一级资本明细":
+        st.caption(f"仅展示最新报告期 {latest}；调整项保留原表正负号，金额单位：{unit_mode}。")
+        _render_chart_legend([("#1E49E2", "净资产 / 核心一级资本", "square"), ("#00C0AE", "增加项", "square"), ("#FD349C", "减少项", "square")])
+        st.caption("瀑布图横轴：0 净资产；1 非认可资产；2 长期股权投资及投资性房地产估值差额；3 递延所得税资产；4 保单未来盈余；5 其他调整；6 核心一级资本。")
+    elif chart_name == "附属一级资本明细":
+        st.caption(f"饼图展示最新报告期 {latest}。金额单位：{unit_mode}。")
+        _render_chart_legend([(color, label, "square") for color, (_, label) in zip(COMPONENT_COLORS, ANC_COMPONENTS)])
+        st.caption("饼图占比以七类可用明细之和为分母；七类均为零或无值时按明细未披露处理；存在负值时不绘制饼图。")
+    elif chart_name == "投资质量六指标雷达图":
+        st.caption(
+            "雷达图轴：1 净资产收益率；2 总资产收益率；3 投资收益率（当季数）；"
+            "4 综合投资收益率（当季数）；5 近三年平均投资收益率；6 近三年平均综合投资收益率。"
+        )
+
+    for company in companies:
+        company_frame = converted.loc[converted["公司"].fillna("").astype(str).eq(company)]
+        missing: list[str] = []
+        invalid: list[str] = []
+        charts: list[tuple[str, object | None]] = []
+        if chart_name in combo_specs:
+            fig, missing, invalid = combo_figure(
+                company_frame, periods, bar_code, line_code,
+                derived_rate=derived, scope=scope, axes=global_axes,
+            )
+            charts.append(("", fig if global_axes else None))
+            if not global_axes:
+                missing = ["所选期间全部指标"]
+        elif chart_name == "投资质量六指标雷达图":
+            fig, missing = radar_figure(company_frame, latest)
+            charts.append(("", fig if len(missing) < 6 else None))
+        elif chart_name == "核心一级资本明细":
+            fig, missing, difference = core_waterfall_figure(company_frame, latest)
+            charts.append(("", fig))
+            omitted = core_omitted_nonzero(company_frame, latest)
+            if omitted:
+                invalid.append("图中省略的非零项目：" + "、".join(
+                    f"{label} {value:,.2f} {unit_mode}" for label, value in omitted
+                ))
+            if difference is not None and abs(difference) > max(abs(float(fig.data[0].y[0])) * 1e-6, 0.01):
+                invalid.append(f"披露终值与已披露调整项之和相差 {difference:,.2f} {unit_mode}")
+        elif chart_name == "附属一级资本明细":
+            pie, pie_missing, negative = anc_pie_figure(company_frame, latest)
+            charts.append(("最新季度构成饼图", pie))
+            missing = [f"{latest}：{item}" for item in pie_missing]
+            if negative:
+                invalid.append("含负值，饼图不绘制：" + "、".join(negative))
+            total = capital_value(company_frame, "ANC_T1_CAPITAL", latest)
+            values = [capital_value(company_frame, code, latest) for code, _ in ANC_COMPONENTS]
+            if total is not None and not pie_missing:
+                delta = total - sum(values)
+                if abs(delta) > max(abs(total) * 1e-6, 0.01):
+                    invalid.append(f"七类明细合计与披露的附属一级资本相差 {delta:,.2f} {unit_mode}")
+        figures[company] = [(subtitle, fig if has_values(fig) else None) for subtitle, fig in charts]
+        if missing:
+            missing_by_company[company] = missing
+        if invalid:
+            invalid_by_company[company] = invalid
+
+    if missing_by_company and chart_name != "近三年平均投资收益率与综合投资收益率":
+        _render_chart_legend([(GREY, "未披露：" + "、".join(missing_by_company), "square")])
+
+    # Use a common radar scale so panels can be compared, including negatives.
+    if chart_name == "投资质量六指标雷达图":
+        radar_points = [value for charts in figures.values() for _, fig in charts if fig is not None
+                        for trace in fig.data for value in trace.r if value is not None]
+        low, high = min([0, *radar_points]), max([0, *radar_points])
+        padding = (high - low) * 0.1 or 1
+        for charts in figures.values():
+            for _, fig in charts:
+                if fig is not None:
+                    fig.update_layout(polar=dict(radialaxis=dict(range=[low - padding if low < 0 else 0, high + padding])))
+    elif chart_name in combo_specs:
+        chart_figures = [fig for charts in figures.values() for _, fig in charts if fig is not None]
+        def axis_range(values):
+            low, high = min([0, *values]), max([0, *values])
+            pad = (high - low) * 0.1 or 1
+            return [low - pad if low < 0 else 0, high + pad]
+        first_values = [v for fig in chart_figures for v in fig.data[0].y if v is not None]
+        second_values = [v for fig in chart_figures for trace in fig.data[1:] for v in trace.y if v is not None]
+        same_unit = chart_name in combo_specs and scope in {"cumulative", "three_year"}
+        left_range = axis_range(first_values + second_values if same_unit else first_values)
+        right_range = left_range if same_unit else axis_range(second_values)
+        for fig in chart_figures:
+            fig.update_yaxes(range=left_range, secondary_y=False)
+            fig.update_yaxes(range=right_range, secondary_y=True)
+    elif chart_name in {"核心一级资本明细", "附属一级资本明细"}:
+        bounds = [0.0]
+        amount_figures = [fig for charts in figures.values() for _, fig in charts
+                          if fig is not None and fig.data[0].type != "pie"]
+        for fig in amount_figures:
+            if fig.data[0].type == "waterfall":
+                running = 0.0
+                for measure, value in zip(fig.data[0].measure, fig.data[0].y):
+                    if value is not None:
+                        running = value if measure == "absolute" else running + value
+                        bounds.append(running)
+            else:
+                for index in range(len(fig.data[0].x)):
+                    values = [trace.y[index] for trace in fig.data if trace.y[index] is not None]
+                    bounds.extend([sum(max(0, v) for v in values), sum(min(0, v) for v in values)])
+        low, high = min(bounds), max(bounds)
+        padding = (high - low) * 0.1 or 1
+        for fig in amount_figures:
+            fig.update_yaxes(range=[low - padding if low < 0 else 0, high + padding])
+    def render_panel(company: str, chart_index: int) -> None:
+        _, fig = figures[company][chart_index]
+        if fig is None:
+            message = "未披露可绘图数据"
+            if chart_name == "附属一级资本明细" and chart_index == 0 and company in invalid_by_company:
+                message = "本期不绘制饼图\n原因见下方注释"
+            chart = empty_company_chart(message, len(companies))
+        else:
+            chart = company_quality_chart(
+                fig, company, len(companies), unit=unit_mode,
+                percentage_bar=chart_name in combo_specs and scope in {"cumulative", "three_year"},
+                color_by_period=chart_name in combo_specs and scope in {"cumulative", "three_year"},
+            )
+        st.altair_chart(chart, width="stretch", key=f"{key_prefix}_{chart_index}_{company}")
+
+    group_titles = (
+        [f"最新季度构成饼图（{latest}）"]
+        if chart_name == "附属一级资本明细" else [""]
     )
+    for chart_index, group_title in enumerate(group_titles):
+        with st.container(key=f"s7_trend_group_{key_prefix}_{chart_index}"):
+            if group_title:
+                st.markdown(f"**{group_title}**")
+            _render_company_chart_grid(
+                converted, lambda _: None, key_prefix=f"{key_prefix}_quality_{chart_index}",
+                highlight_company=highlight_company, selected_companies=companies,
+                panel_renderer=lambda company, index=chart_index: render_panel(company, index),
+            )
+    # Long notes sit below the row, so missing data cannot stretch one panel.
+    for note in _missing_disclosure_note_lines(chart_name, companies, missing_by_company):
+        st.caption(note)
+    for company in companies:
+        if company in invalid_by_company:
+            st.caption(f"注：{company}：" + "；".join(invalid_by_company[company]))
 
 
 def _chart_input_metric_codes(chart_name: str, plan_kind: str) -> tuple[str, ...]:
@@ -1451,6 +2078,8 @@ def _chart_input_metric_codes(chart_name: str, plan_kind: str) -> tuple[str, ...
             codes.append(denominator_code)
         if chart_name == "量化风险最低资本构成":
             codes.extend(QUANT_RISK_STACK_RATIO_CODES.values())
+    if plan_kind == CAPITAL_RATIO_COMBO and chart_name == "核心充足率变化":
+        codes.append("ACTUAL_CAPITAL")
     return tuple(dict.fromkeys(codes))
 
 
@@ -1477,6 +2106,12 @@ def _render_combination_analysis(
             f"“{chart_name}”在新版 Excel 中标记为“待定”，目前没有定义可绘图的明细组成指标。"
         )
         return
+    if plan.kind == QUALITY_AND_CAPITAL:
+        _render_quality_and_capital(
+            frame, chart_name, periods=periods, unit_mode=unit_mode,
+            highlight_company=highlight_company, key_prefix=key_prefix,
+        )
+        return
     required_codes = _chart_input_metric_codes(chart_name, plan.kind)
     chart_frame = (
         frame[frame["指标编码"].fillna("").astype(str).isin(required_codes)].copy()
@@ -1489,7 +2124,7 @@ def _render_combination_analysis(
     dense_company_panels = company_panel_count >= 10
     if plan.kind == SOLVENCY_RATIO_COMBO:
         shared_y_domain = solvency_ratio_axis_domain(converted, periods)
-        period_colors = report_period_color_map(periods)
+        period_colors = report_period_combo_bar_color_map(periods)
         st.caption(
             "图表说明：柱状图为综合偿付能力充足率；粉色折线为核心偿付能力充足率。"
             "各公司统一使用同一百分比纵轴范围，柱形颜色对应不同报告期。"
@@ -1563,6 +2198,7 @@ def _render_combination_analysis(
             "上方 KPMG Pink 折线展示对应充足率，下方堆叠柱展示资本规模；"
             "同组所有公司统一使用同一金额纵轴范围，便于直接比较资本规模。"
         )
+        st.markdown("**堆叠柱组合图**")
         _render_chart_legend([
             *[
                 (KPMG_CAPITAL_COMBO_COLORS[index], label, "square")
@@ -1636,6 +2272,11 @@ def _render_combination_analysis(
                 "柱高按各构成项目/量化风险最低资本的比例展示，实际金额仅保留在悬浮信息中；"
                 "数据标签与对应比例折线图一致，负向抵减项目位于零线下方。"
             )
+        elif chart_name == "各类保险风险（寿）占比":
+            st.caption(
+                "柱高按各构成项目/寿险业务保险风险最低资本的比例展示，实际金额仅保留在悬浮信息中；"
+                "负向风险分散效应位于零线下方。"
+            )
         elif chart_name == "各类市场风险占比":
             st.caption(
                 "柱高按各构成项目/市场风险最低资本的比例展示，实际金额仅保留在悬浮信息中；"
@@ -1646,6 +2287,14 @@ def _render_combination_analysis(
                 "柱高按各构成项目/信用风险最低资本的比例展示，实际金额仅保留在悬浮信息中；"
                 "负向风险分散效应位于零线下方。"
             )
+        elif chart_name == "认可资产构成":
+            st.caption(
+                "柱高按各资产构成项目/认可资产合计的比例展示，实际金额仅保留在悬浮信息中；"
+                "正数项目自零线向上堆叠，负数项目自零线向下堆叠，保留原始正负号；"
+                "微小负占比保留真实柱高，并用零线下方的标签和引线标明；"
+                "展示已登记指标编码的现金及流动性管理工具、投资资产、在子公司合营企业和联营企业中的权益、"
+                "再保险资产、应收及预付款项、固定资产、土地使用权、独立账户资产、其他认可资产九类资产。"
+            )
         else:
             st.caption("按公司分面展示构成；负向抵减项目位于零线下方，所有颜色均来自 KPMG 色卡。")
         negative_component_codes = (
@@ -1654,6 +2303,8 @@ def _render_combination_analysis(
                 "CONTRACT_LOSS_ABSORPTION_EFFECT",
             )
             if chart_name == "量化风险最低资本构成"
+            else ("LIFE_INSURANCE_RISK_DIVERSIFICATION_EFFECT",)
+            if chart_name == "各类保险风险（寿）占比"
             else ("MARKET_RISK_DIVERSIFICATION_EFFECT",)
             if chart_name == "各类市场风险占比"
             else ("CREDIT_RISK_DIVERSIFICATION_EFFECT",)
@@ -1673,6 +2324,7 @@ def _render_combination_analysis(
                 ),
                 label_denominator_code=COMPONENT_STACK_DENOMINATOR_CODES[chart_name],
                 negative_component_codes=negative_component_codes,
+                show_small_negative_labels=chart_name == "认可资产构成",
             )
             if proportion_stack
             else component_stack_axis_domain(
@@ -1707,11 +2359,13 @@ def _render_combination_analysis(
                 panel_count=company_panel_count,
                 shared_y_domain=shared_stack_domain,
                 plot_proportions=proportion_stack,
+                show_small_negative_labels=chart_name == "认可资产构成",
                 min_label_share=(
                     0.10
-                    if chart_name == "各类市场风险占比"
+                    if chart_name in {"各类保险风险（寿）占比", "各类市场风险占比"}
                     else None
                 ),
+                hide_labels_at_threshold=chart_name == "各类保险风险（寿）占比",
             ),
             key_prefix=f"{key_prefix}_component_stack",
             highlight_company=highlight_company,
@@ -1855,13 +2509,13 @@ def show_step_7_solvency(
     if data is None or data.empty:
         st.info("请先在 Step5 确认集成数据，或在 Step6 上传集成表。")
         return
-    frame = company_detail_rows(data).copy()
-    if frame.empty:
+    status_frame = display_company_names(company_detail_rows(data))
+    if status_frame.empty:
         st.info("当前数据没有公司明细记录。")
         return
-    frame["数值"] = pd.to_numeric(frame["数值"], errors="coerce")
-    frame = frame.dropna(subset=["数值"])
-    all_periods = sort_report_periods(frame["报告期"])
+    status_frame["数值"] = pd.to_numeric(status_frame["数值"], errors="coerce")
+    frame = status_frame.dropna(subset=["数值"]).copy()
+    all_periods = sort_report_periods(status_frame["报告期"])
     if not all_periods:
         st.info("当前数据没有可用报告期。")
         return
@@ -1877,7 +2531,7 @@ def show_step_7_solvency(
     image_overrides: dict[str, dict[str, object]] = {}
     with st.expander("公司级图表设置与图片覆盖", expanded=False, icon=":material/tune:"):
         c0, c1, c2, c3, c4 = st.columns([1, 2, 1, 1, 1])
-        peer_groups = nonblank_values(frame, "同业分类")
+        peer_groups = nonblank_values(status_frame, "同业分类")
         type_options = [ALL_COMPANY_TYPES, *peer_groups]
         st.session_state.setdefault("s7_company_types", [ALL_COMPANY_TYPES])
         _valid_state("s7_company_types", type_options, multiple=True)
@@ -1887,11 +2541,11 @@ def show_step_7_solvency(
                 type_options,
                 key="s7_company_types",
                 on_change=_reset_company_selection_for_types,
-                args=(frame,),
+                args=(status_frame,),
                 help="沿用偿付能力平台的‘同业分类’字段进行筛选。",
             )
         company_source, all_companies = _company_scope_for_types(
-            frame,
+            status_frame,
             selected_types_raw,
         )
         company_selection_key = _sync_company_selection_state(
@@ -1977,12 +2631,17 @@ def show_step_7_solvency(
         st.info("请在报告配置中至少选择一家展示公司。")
         return
     scoped = filter_analysis_frame(frame, companies=selected_companies, periods=selected_periods)
+    scoped_status = filter_analysis_frame(
+        status_frame,
+        companies=selected_companies,
+        periods=selected_periods,
+    )
     scoped["_s7_company_order"] = pd.Categorical(
         scoped["公司"], categories=selected_companies, ordered=True
     )
     scoped = scoped.sort_values(["_s7_company_order", "报告期"]).drop(columns="_s7_company_order")
 
-    chart_names = _selected_chart_names(scoped)
+    chart_names = _selected_chart_names(scoped_status)
     if not chart_names:
         st.info("请在侧边栏公司报告导航中选择具体图表。")
         return
@@ -2028,7 +2687,7 @@ def show_step_7_solvency(
                 )
             else:
                 plan = chart_plan_for(chart_name)
-                available_codes = set(scoped["指标编码"].fillna("").astype(str))
+                available_codes = set(scoped_status["指标编码"].fillna("").astype(str))
                 entry = entries[0] if entries else None
                 missing_codes = (
                     [code for code in entry.metric_codes if code not in available_codes]
@@ -2040,11 +2699,18 @@ def show_step_7_solvency(
                         f"“{chart_name}”缺少 {len(missing_codes)} 个必要指标，暂无法按 Excel 指定格式完整绘图。"
                     )
                     st.caption("缺失指标编码：" + "、".join(missing_codes))
+                elif plan.kind == QUALITY_AND_CAPITAL:
+                    _render_quality_and_capital(
+                        scoped_status, chart_name, periods=selected_periods,
+                        unit_mode=unit_mode, highlight_company=highlight_company,
+                        key_prefix=f"s7_{chart_index}", selected_companies=selected_companies,
+                    )
                 elif plan.kind in {SINGLE_METRIC_TREND, TREND_WITH_COMPANY_BARS, COMPANY_BAR_TREND}:
                     for code in metric_codes_for_chart(chart_name):
                         _render_report_metric(
                             scoped,
                             code,
+                            status_frame=scoped_status,
                             periods=selected_periods,
                             show_labels=show_labels,
                             decimals=decimals,

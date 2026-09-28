@@ -18,6 +18,7 @@ from dashboard_components import (
     render_report_footnote,
     render_report_notes_editor,
 )
+from services.solvency_company_identity import display_company_names
 from services.solvency_navigation import (
     INDUSTRY_NAVIGATION,
     INDUSTRY_QUANT_CHART,
@@ -587,7 +588,7 @@ def show_step_8_solvency(
         st.info("请先在 Step5 确认多公司集成数据。")
         return
     industry_totals = _industry_total_rows(data)
-    frame = company_detail_rows(data).copy()
+    frame = display_company_names(company_detail_rows(data))
     if frame.empty:
         st.info("当前数据没有公司明细记录。")
         return

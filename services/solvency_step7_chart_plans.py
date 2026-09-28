@@ -4,9 +4,6 @@ from dataclasses import dataclass
 
 from .solvency_navigation import (
     COMPANY_NAVIGATION,
-    CREDIT_RISK_ASSET_SCATTER,
-    INSURANCE_RISK_LIABILITY_SCATTER,
-    MARKET_RISK_ASSET_SCATTER,
 )
 
 
@@ -27,6 +24,7 @@ RISK_RATIO_SCATTER = "risk_ratio_scatter"
 KEY_METRICS_TABLE = "key_metrics_table"
 FINANCING_TABLE = "financing_table"
 PENDING_DEFINITION = "pending_definition"
+QUALITY_AND_CAPITAL = "quality_and_capital"
 
 
 @dataclass(frozen=True)
@@ -38,7 +36,7 @@ class ChartPlan:
 SPECIAL_CHART_PLANS: dict[str, ChartPlan] = {
     "关键偿付数据概览": ChartPlan(
         KEY_METRICS_TABLE,
-        "最新两期关键偿付数据变动表",
+        "最新报告期与去年同期关键偿付数据对照表",
     ),
     "核心及综合充足率": ChartPlan(
         SOLVENCY_RATIO_COMBO,
@@ -58,28 +56,28 @@ SPECIAL_CHART_PLANS: dict[str, ChartPlan] = {
     ),
     "资本使用效率与核心资本占比气泡图": ChartPlan(
         CAPITAL_EFFICIENCY_BUBBLE,
-        "最新报告期实际资本/认可资产、核心资本/注册资本与认可资产规模气泡图",
+        "最新报告期实际资本/注册资本、核心资本/注册资本与认可资产规模气泡图",
     ),
     "核心资本/注册资本": ChartPlan(
-        TREND_WITH_COMPANY_BARS,
-        "多公司跨期折线图及统一纵轴的公司报告期柱状小图",
+        SINGLE_METRIC_TREND,
+        "多公司跨期折线图",
     ),
     "计入核心资本的保单未来盈余/核心资本的比例": ChartPlan(
-        TREND_WITH_COMPANY_BARS,
-        "多公司跨期折线图及统一纵轴的公司报告期柱状小图",
+        SINGLE_METRIC_TREND,
+        "多公司跨期折线图",
     ),
     "资本规模与结构": ChartPlan(
         CAPITAL_AMOUNT_COMBO,
         "核心一级、核心二级、附属一级和附属二级资本堆叠图",
     ),
-    "核心资本明细占比-待定": ChartPlan(
-        PENDING_DEFINITION,
-        "Excel 标记为待定，尚无组成指标定义",
-    ),
-    "附属资本明细占比-待定": ChartPlan(
-        PENDING_DEFINITION,
-        "Excel 标记为待定，尚无组成指标定义",
-    ),
+    "核心一级资本明细": ChartPlan(QUALITY_AND_CAPITAL, "最新报告期核心一级资本瀑布图"),
+    "附属一级资本明细": ChartPlan(QUALITY_AND_CAPITAL, "最新报告期构成饼图"),
+    "签单保费与新业务利润率": ChartPlan(QUALITY_AND_CAPITAL, "公司小图：签单保费柱形与新业务利润率折线"),
+    "新业务价值与新业务价值率": ChartPlan(QUALITY_AND_CAPITAL, "公司小图：新业务价值柱形与价值率折线"),
+    "综合退保率": ChartPlan(QUALITY_AND_CAPITAL, "全部所选公司的综合退保率折线对比"),
+    "投资质量六指标雷达图": ChartPlan(QUALITY_AND_CAPITAL, "最新季度六项投资质量指标"),
+    "累计投资收益率与累计综合投资收益率": ChartPlan(QUALITY_AND_CAPITAL, "累计投资收益率柱形与累计综合投资收益率折线"),
+    "近三年平均投资收益率与综合投资收益率": ChartPlan(QUALITY_AND_CAPITAL, "近三年平均投资收益率柱形与平均综合投资收益率折线"),
     "计入各级资本的保单未来盈余构成占比": ChartPlan(
         COMPONENT_STACK,
         "计入各级资本的保单未来盈余构成占比堆叠图",
@@ -100,17 +98,9 @@ SPECIAL_CHART_PLANS: dict[str, ChartPlan] = {
         COMPONENT_STACK,
         "信用风险最低资本构成堆叠图",
     ),
-    MARKET_RISK_ASSET_SCATTER: ChartPlan(
-        RISK_RATIO_SCATTER,
-        "最新报告期利率风险与权益价格风险占认可资产率公司气泡图",
-    ),
-    CREDIT_RISK_ASSET_SCATTER: ChartPlan(
-        RISK_RATIO_SCATTER,
-        "最新报告期利差风险与对手违约风险占认可资产率公司气泡图",
-    ),
-    INSURANCE_RISK_LIABILITY_SCATTER: ChartPlan(
-        RISK_RATIO_SCATTER,
-        "最新报告期寿险与非寿险保险风险占认可负债率公司气泡图",
+    "认可资产构成": ChartPlan(
+        COMPONENT_STACK,
+        "认可资产构成堆叠图（现金及流动性管理工具、投资资产、在子公司合营企业和联营企业中的权益、再保险资产、应收及预付款项、固定资产、土地使用权、独立账户资产、其他认可资产）",
     ),
     "增资发债信息统计": ChartPlan(
         FINANCING_TABLE,
