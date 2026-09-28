@@ -6,6 +6,7 @@ from __future__ import annotations
 STEP7_FILTER_RUNTIME_REVISION = 3
 
 import io
+import hashlib
 import hmac
 import html
 import os
@@ -23,6 +24,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 from dashboard_components import render_kpmg_palette, render_print_control
+from services.solvency_locator_roles import LOCATOR_ROLE_LABELS
 from services.report_profiles import (
     ProfileValidationError,
     ReportProfile,
@@ -30,27 +32,44 @@ from services.report_profiles import (
     load_profile_workbook,
     profile_workbook_bytes,
 )
-from services.solvency_ai_table_extractor import (
-    extraction_logs_frame,
-    reconstructed_workbook_bytes,
+from services.solvency_vlm_v2_pipeline import (
+    VLMV2LocatorRun,
+    evaluate_vlm_v2_step3_gate,
+    extract_metrics_vlm_v2,
+    locate_tables_vlm_v2,
+    read_vlm_v2_extracted_tables,
+    refresh_vlm_v2_cross_table_checks,
+    vlm_v2_to_extracted_tables,
+    vlm_v2_gold_evaluation,
+    vlm_v2_workbook_bytes,
 )
-from services.solvency_hybrid_pipeline import (
-    extract_tables_hybrid,
-    locate_tables_hybrid,
+from services.solvency_vlm_v2_benchmark import (
+    blind_scores_workbook_bytes,
+    blind_test_template_bytes,
+    combine_blind_scores,
+    match_blind_case,
+    read_blind_gold_workbook,
+    score_blind_case,
 )
 from services.solvency_dataset_adapter import (
     add_missing_derived_metrics,
     convert_external_workbook,
     read_standard_workbook,
+    standard_workbook_bytes,
 )
-from services.solvency_company_identity import load_peer_group_config
+from services.solvency_company_identity import load_peer_group_config, resolve_peer_group
 from services.solvency_step3_standardizer import (
+    infer_step3_session_metadata,
+    infer_step3_upload_metadata,
+    normalize_report_period,
     read_target_template,
     result_workbook_bytes,
     standardize_to_target,
     step3_metric_catalog,
     target_template_workbook_bytes,
 )
+from services.solvency_table_extractor import ExtractedTable
+from services.solvency_display import dataframe_for_display
 from services.solvency_step6_analysis import (
     CHART_TYPES,
     COMPANY_REPORT,
@@ -68,6 +87,7 @@ from services.solvency_step6_analysis import (
     visualization_metric_frame,
 )
 from services.solvency_metric_registry import extend_taxonomy
+from services.solvency_filing_catalog import extend_filing_taxonomy
 from services.solvency_financing_analysis import read_major_financing_workbook
 from services.solvency_navigation import (
     COMPANY_FIRST_LEVELS,
@@ -88,6 +108,7 @@ from services.solvency_gold_standard import (
 from services.solvency_normalizer import (
     STANDARD_COLUMNS,
     load_taxonomy,
+    narrow_table_view,
     upgrade_standard_frame,
 )
 from services.solvency_pdf_locator import (
@@ -98,7 +119,10 @@ from services.solvency_pdf_locator import (
 from services.solvency_validator import (
     load_validation_rules,
     validate_standard_data,
-    validation_status_summary,
+)
+from services.solvency_validation_workbook import (
+    validation_display_frame,
+    validation_workbook_bytes,
 )
 from step7_solvency import show_step_7_solvency
 from step8_solvency import show_step_8_solvency
@@ -298,7 +322,7 @@ def _render_login_page() -> None:
 
         st.markdown(
             "<div style='text-align:center; color:#94A3B8; font-size:11px; "
-            "margin-top:30px; letter-spacing:1px;'>系统版本：v0.3.1 © 2026<br>"
+            "margin-top:30px; letter-spacing:1px;'>系统版本：v4.0 © 2026<br>"
             "保险报告处理与分析平台</div>",
             unsafe_allow_html=True,
         )
@@ -383,6 +407,14 @@ def new_state_defaults() -> dict[str, object]:
         "metadata": {},
         "page_matches": [],
         "auto_page_matches": [],
+        "vlm_v2_locator_run": None,
+        "vlm_v2_extraction_run": None,
+        "vlm_v2_locator_elapsed": 0.0,
+        "vlm_v2_extraction_elapsed": 0.0,
+        "vlm_v2_workbook_bytes": b"",
+        "vlm_v2_blind_summary": pd.DataFrame(),
+        "vlm_v2_blind_details": pd.DataFrame(),
+        "vlm_v2_blind_workbook_bytes": b"",
         "raw_tables": [],
         "table_candidates": {},
         "selected_table_candidates": {},
@@ -471,6 +503,99 @@ def read_peer_groups(
 
 
 @st.cache_data(show_spinner=False)
+def read_extracted_tables_workbook(
+    workbook_bytes: bytes,
+    profile_tables: list[dict],
+) -> list[ExtractedTable]:
+    """从 STEP2 下载的标准化提取 Excel 重建提取表格，供 STEP3 直接标准化。
+
+    优先读取 VLM v2 指标结果并复核前置门槛；兼容旧版「表名_P页码」工作表。
+    """
+    if not workbook_bytes:
+        return []
+
+    def _sanitize(value: str) -> str:
+        return re.sub(r"[\\/*?:\[\]]", "", str(value).strip())
+
+    name_to_id = {
+        _sanitize(str(item.get("table_name", ""))): str(item.get("table_id", ""))
+        for item in profile_tables
+        if item.get("table_name") and item.get("table_id")
+    }
+    ordered_names = sorted(name_to_id, key=len, reverse=True)
+
+    excel = pd.ExcelFile(io.BytesIO(workbook_bytes))
+    if "VLM_v2指标结果" in excel.sheet_names:
+        return read_vlm_v2_extracted_tables(excel)
+    tables: list[ExtractedTable] = []
+    table_index = 0
+    for sheet_name in excel.sheet_names:
+        if sheet_name in {"提取日志", "单位信息", "报告元信息"}:
+            continue
+        frame = pd.read_excel(excel, sheet_name=sheet_name, header=None)
+        rows = [
+            ["" if pd.isna(cell) else str(cell).strip() for cell in row]
+            for row in frame.values.tolist()
+        ]
+        rows = [row for row in rows if row and row[0] != "【单位备注】"]
+        rows = [row for row in rows if any(cell for cell in row)]
+        if len(rows) < 2:
+            continue
+        sheet_key = _sanitize(sheet_name)
+        table_id = ""
+        for candidate in ordered_names:
+            if sheet_key.startswith(candidate):
+                table_id = name_to_id[candidate]
+                break
+        if not table_id:
+            continue
+        page_match = re.search(r"_P(\d+)", sheet_key)
+        page = int(page_match.group(1)) if page_match else table_index + 1
+        tables.append(
+            ExtractedTable(
+                table_id=table_id,
+                table_name=sheet_name,
+                page=page,
+                table_index=table_index,
+                rows=rows,
+                strategy="手动上传",
+                quality_score=0.0,
+                evidence="来自本地 STEP2 标准化提取 Excel",
+                source_pages=[page],
+                unit_records=[],
+                profile_strategy_id="",
+            )
+        )
+        table_index += 1
+    return tables
+
+
+@st.cache_data(show_spinner=False)
+def read_step3_upload_metadata(
+    workbook_bytes: bytes,
+    filename: str,
+    company_items: tuple[tuple[str, str], ...],
+    peer_group_items: tuple[tuple[str, str], ...],
+    default_peer_group: str,
+    context_metadata_items: tuple[tuple[str, str], ...],
+    context_filename: str,
+):
+    company_candidates = tuple(
+        {"company_name": name, "company_type": company_type}
+        for name, company_type in company_items
+    )
+    return infer_step3_upload_metadata(
+        workbook_bytes,
+        filename,
+        company_candidates,
+        peer_group_map=dict(peer_group_items),
+        default_peer_group=default_peer_group,
+        context_metadata=dict(context_metadata_items),
+        context_filename=context_filename,
+    )
+
+
+@st.cache_data(show_spinner=False)
 def read_uploaded_profile(
     workbook_bytes: bytes,
     source_name: str,
@@ -521,6 +646,11 @@ def read_major_financing_upload(
 @st.cache_data(show_spinner=False)
 def read_taxonomy(path: str) -> pd.DataFrame:
     return load_taxonomy(path)
+
+
+def extraction_taxonomy(profile: ReportProfile, path: str) -> pd.DataFrame:
+    taxonomy = profile.taxonomy_frame() if profile.field_dictionary else read_taxonomy(path)
+    return extend_filing_taxonomy(taxonomy) if profile.profile_id == 'LIFE_SOLVENCY' else taxonomy
 
 
 @st.cache_data(show_spinner=False)
@@ -753,13 +883,13 @@ def check_company_report(
     timeout: int = 15,
 ) -> dict:
     company = str(row.get("公司", "")).strip()
-    category = str(row.get("公司类别", "")).strip()
+    peer_group = str(row.get("同业分类", "")).strip()
     url = str(row.get("报告披露地址", "")).strip()
     checked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     target_period = str(year) if frequency.upper() == "ANNUAL" else f"{year}{period}"
     base = {
         "公司": company,
-        "公司类别": category,
+        "同业分类": peer_group,
         "报告类型": report_name,
         "目标报告期": target_period,
         "检查结果": "",
@@ -881,6 +1011,73 @@ def parse_page_numbers(raw_value: str, total_pages: int) -> tuple[list[int], lis
     return valid_pages, invalid_values
 
 
+LOCATOR_SOURCE_LABELS = {
+    "local": "正文标题 / 首尾边界",
+    "semantic": "大模型标题语义",
+    "vision": "图片标题确认",
+    "directory": "目录页码换算",
+    "radar": "表格结构雷达",
+    **LOCATOR_ROLE_LABELS,
+}
+
+
+def locator_candidate_rows(match: PageMatch) -> list[dict[str, object]]:
+    """Expose every locator channel for transparent human page review."""
+    rows = [{
+        "候选来源": "系统收敛结果（推荐）",
+        "物理页码": list(match.pages),
+        "用途": "当前推荐提取范围；仍需结合右侧PDF人工确认",
+    }]
+    for source_id, label in LOCATOR_SOURCE_LABELS.items():
+        pages = sorted(set(match.sources.get(source_id, [])))
+        if not pages:
+            continue
+        rows.append({
+            "候选来源": label,
+            "物理页码": pages,
+            "用途": (
+                "高置信正文证据"
+                if source_id == "local"
+                else "辅助候选，采用前请核对右侧PDF原页"
+            ),
+        })
+    return rows
+
+
+def apply_locator_candidate(input_key: str, pages: list[int]) -> None:
+    st.session_state[input_key] = ", ".join(map(str, pages))
+    st.session_state.pages_confirmed = False
+
+
+def render_locator_evidence(match: PageMatch, input_key: str) -> None:
+    """Keep long evidence and candidate controls in one collapsed detail area."""
+    with st.expander("查看定位证据 / 目录 / 标题 / 结构候选来源", expanded=False):
+        auto_text = ", ".join(map(str, match.pages)) if match.pages else "未自动找到"
+        st.caption(f"自动定位：{auto_text}")
+        st.caption(f"识别依据：{match.evidence or '无明确关键词证据'}")
+        if match.review_required:
+            st.warning(match.review_reason or "请人工核对候选范围")
+        candidate_rows = locator_candidate_rows(match)
+        display_frame = pd.DataFrame(candidate_rows)
+        display_frame["物理页码"] = display_frame["物理页码"].map(
+            lambda pages: ", ".join(map(str, pages)) or "未找到"
+        )
+        st.dataframe(display_frame, width="stretch", hide_index=True)
+        selected_candidate = st.selectbox(
+            "选择一个候选范围", range(len(candidate_rows)),
+            format_func=lambda index: (
+                f"{candidate_rows[index]['候选来源']}："
+                f"{', '.join(map(str, candidate_rows[index]['物理页码'])) or '未找到'}"
+            ), key=f"locator_candidate_{match.table_id}",
+        )
+        st.button(
+            "采用所选候选页", key=f"apply_locator_candidate_{match.table_id}",
+            on_click=apply_locator_candidate,
+            args=(input_key, list(candidate_rows[selected_candidate]["物理页码"])),
+            width="stretch",
+        )
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
 def dataframe_to_xlsx(frame: pd.DataFrame, sheet_name: str) -> bytes:
     output = io.BytesIO()
@@ -906,7 +1103,7 @@ def cached_convert_external_workbook(
     )
 
 
-@st.cache_data(show_spinner=False, max_entries=12)
+@st.cache_data(show_spinner=False, max_entries=128)
 def cached_read_standard_workbook(
     workbook_bytes: bytes,
     filename: str,
@@ -920,23 +1117,11 @@ def cached_complete_step5_metrics(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def validation_results_to_xlsx(results: pd.DataFrame) -> bytes:
-    summary = validation_status_summary(results)
-    category_summary = (
-        results.groupby(["check_type", "status"], dropna=False)
-        .size()
-        .rename("数量")
-        .reset_index()
-        .rename(columns={"check_type": "检查类别", "status": "状态"})
-    )
-    issues = results[~results["status"].isin(["通过", "不适用"])].copy()
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        summary.to_excel(writer, sheet_name="状态汇总", index=False)
-        category_summary.to_excel(writer, sheet_name="分类汇总", index=False)
-        results.to_excel(writer, sheet_name="检查明细", index=False)
-        issues.to_excel(writer, sheet_name="待处理事项", index=False)
-    return output.getvalue()
+def validation_results_to_xlsx(
+    results: pd.DataFrame,
+    step3_workbook: bytes,
+) -> bytes:
+    return validation_workbook_bytes(results, step3_workbook)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -1175,6 +1360,18 @@ if is_project_member:
                 str(active_profile.monitoring["company_type_column"]),
                 str(active_profile.monitoring["report_url_column"]),
             )
+        monitor_peer_group_map, monitor_default_peer_group = read_peer_groups(
+            PEER_GROUP_CONFIG,
+            PEER_GROUP_CONFIG.stat().st_mtime_ns,
+        )
+        companies = companies.copy()
+        companies["同业分类"] = companies["公司"].map(
+            lambda name: resolve_peer_group(
+                name,
+                monitor_peer_group_map,
+                monitor_default_peer_group,
+            )
+        )
 
         year_col, quarter_col = st.columns(2)
         target_year = int(year_col.number_input("报告年度", 2020, 2050, 2026))
@@ -1187,15 +1384,15 @@ if is_project_member:
                 ["Q1", "Q2", "Q3", "Q4"],
             )
 
-        all_categories = sorted(companies["公司类别"].dropna().unique().tolist())
+        all_categories = sorted(companies["同业分类"].dropna().unique().tolist())
         selected_categories = st.multiselect(
-            "公司类别",
+            "同业分类",
             all_categories,
             default=all_categories,
-            key="monitor_company_categories",
+            key="monitor_peer_groups",
         )
         filtered_companies = companies[
-            companies["公司类别"].isin(selected_categories)
+            companies["同业分类"].isin(selected_categories)
         ].reset_index(drop=True)
 
         st.caption(
@@ -1203,7 +1400,7 @@ if is_project_member:
             f"运行时使用 {active_profile.profile_id} 的公司来源配置。"
         )
         st.dataframe(
-            filtered_companies,
+            filtered_companies[["公司", "同业分类", "报告披露地址"]],
             width="stretch",
             hide_index=True,
             column_config={
@@ -1216,7 +1413,7 @@ if is_project_member:
 
         st.markdown("#### 逐个查看")
         if filtered_companies.empty:
-            st.warning("当前类别筛选下没有公司。")
+            st.warning("当前同业分类筛选下没有公司。")
         else:
             selected_company = st.selectbox(
                 "选择需要检查的公司",
@@ -1368,7 +1565,7 @@ if is_project_member:
 
     with tabs[1]:
         st.subheader("📑 智能页码定位")
-        st.caption("系统结合页面语义推断与表格结构雷达定位目标表；跨页页码可在左侧人工修改，右侧同步显示PDF原页。")
+        st.caption("系统使用VLM v2直接浏览整份PDF并定位目标表；跨页页码可在左侧人工修改，右侧同步显示PDF原页。")
 
         feature_config = dict(active_profile.feature_config)
         table_configs = feature_config.get("tables", [])
@@ -1382,6 +1579,11 @@ if is_project_member:
             st.session_state.raw_tables = []
             st.session_state.ai_extraction_logs = []
             st.session_state.ai_workbook_bytes = b""
+            st.session_state.vlm_v2_locator_run = None
+            st.session_state.vlm_v2_extraction_run = None
+            st.session_state.vlm_v2_locator_elapsed = 0.0
+            st.session_state.vlm_v2_extraction_elapsed = 0.0
+            st.session_state.vlm_v2_workbook_bytes = b""
             st.session_state.standard_data = pd.DataFrame(columns=STANDARD_COLUMNS)
             st.session_state.validation_results = pd.DataFrame()
             st.session_state.normalization_diagnostics = pd.DataFrame()
@@ -1412,6 +1614,11 @@ if is_project_member:
                 st.session_state.selected_table_candidates = {}
                 st.session_state.ai_extraction_logs = []
                 st.session_state.ai_workbook_bytes = b""
+                st.session_state.vlm_v2_locator_run = None
+                st.session_state.vlm_v2_extraction_run = None
+                st.session_state.vlm_v2_locator_elapsed = 0.0
+                st.session_state.vlm_v2_extraction_elapsed = 0.0
+                st.session_state.vlm_v2_workbook_bytes = b""
                 st.session_state.extraction_grid_cache = {}
                 st.session_state.extraction_image_cache = {}
                 st.session_state.extraction_cache_lock = Lock()
@@ -1483,19 +1690,105 @@ if is_project_member:
                             "Base URL、模型名称和 API Key 后重新进入。"
                         )
                     else:
-                        with st.spinner("正在检测PDF文字层并执行语义、结构与图片页码定位..."):
-                            selected_feature_config = {
-                                **feature_config,
-                                "tables": selected_configs,
-                            }
-                            matches, locator_message = locate_tables_hybrid(
-                                incoming,
-                                selected_feature_config,
-                                api_key=st.session_state.llm_api_key,
-                                base_url=st.session_state.llm_base_url,
-                                model=st.session_state.llm_model,
-                                profile_context=active_profile.locator_context(),
-                            )
+                        try:
+                            vlm_v2_taxonomy = extraction_taxonomy(active_profile, str(taxonomy_path))
+                            started = perf_counter()
+                            with st.status(
+                                "VLM v2正在分批浏览整份PDF并定位目标表...",
+                                expanded=True,
+                            ) as locator_status:
+                                locator_progress = st.progress(
+                                    0,
+                                    text="正在生成每批最多6页的定位拼图...",
+                                )
+
+                                def update_locator_progress(event):
+                                    phase = str(event.get("phase", ""))
+                                    elapsed = float(event.get("elapsed_seconds", 0.0) or 0.0)
+                                    if phase == "locator_started":
+                                        total = max(1, int(event.get("total_batches", 0) or 0))
+                                        locator_progress.progress(
+                                            5,
+                                            text=f"开始定位，共{total}批，每批最多6页 · 已用时{elapsed:.1f}秒",
+                                        )
+                                    elif phase == "locator_batch_completed":
+                                        completed = int(event.get("completed_batches", 0) or 0)
+                                        total = max(1, int(event.get("total_batches", 0) or 0))
+                                        batch_index = int(event.get("batch_index", 0) or 0)
+                                        round_name = str(event.get("round_name", "首轮"))
+                                        status_text = str(event.get("status", ""))
+                                        pages = event.get("visible_pages", [])
+                                        page_text = (
+                                            f"{min(pages)}-{max(pages)}页"
+                                            if pages else "未知页"
+                                        )
+                                        base = 10 if round_name == "首轮" else 82
+                                        span = 70 if round_name == "首轮" else 14
+                                        locator_progress.progress(
+                                            min(96, base + round(span * completed / total)),
+                                            text=(
+                                                f"{round_name}完成 {completed}/{total}："
+                                                f"批次{batch_index}（{page_text}，{status_text}）"
+                                                f" · 已用时{elapsed:.1f}秒"
+                                            ),
+                                        )
+                                        locator_status.write(
+                                            f"{round_name}批次{batch_index}：{page_text}，{status_text}"
+                                        )
+                                    elif phase == "locator_retry_started":
+                                        indexes = "、".join(
+                                            str(value) for value in event.get("batch_indexes", [])
+                                        )
+                                        locator_progress.progress(
+                                            82,
+                                            text=f"仅重试超时批次：{indexes} · 已用时{elapsed:.1f}秒",
+                                        )
+                                    elif phase == "locator_completed":
+                                        locator_progress.progress(
+                                            100,
+                                            text=f"页面定位批次处理完成 · 总用时{elapsed:.1f}秒",
+                                        )
+
+                                vlm_run = locate_tables_vlm_v2(
+                                    incoming,
+                                    selected_configs,
+                                    vlm_v2_taxonomy,
+                                    api_key=st.session_state.llm_api_key,
+                                    base_url=st.session_state.llm_base_url,
+                                    model=st.session_state.llm_model,
+                                    timeout=90,
+                                    request_max_attempts=2,
+                                    pages_per_sheet=6,
+                                    sheets_per_call=1,
+                                    max_workers=2,
+                                    progress_callback=update_locator_progress,
+                                )
+                                scan_diagnostics = vlm_run.diagnostics[
+                                    vlm_run.diagnostics["轮次"].isin(["首轮", "超时重试"])
+                                ]
+                                latest_batches = (
+                                    scan_diagnostics.sort_values("调用序号", kind="stable")
+                                    .groupby("批次序号", sort=False)
+                                    .tail(1)
+                                )
+                                unresolved_batches = latest_batches[
+                                    latest_batches["状态"] != "成功"
+                                ]
+                                locator_status.update(
+                                    label=(
+                                        "VLM v2定位完成"
+                                        if unresolved_batches.empty
+                                        else f"VLM v2定位完成，{len(unresolved_batches)}个批次仍需人工核验"
+                                    ),
+                                    state="complete" if unresolved_batches.empty else "error",
+                                    expanded=not unresolved_batches.empty,
+                                )
+                            matches = list(vlm_run.matches)
+                            st.session_state.vlm_v2_locator_run = vlm_run
+                            st.session_state.vlm_v2_locator_elapsed = perf_counter() - started
+                            st.session_state.vlm_v2_extraction_run = None
+                            st.session_state.vlm_v2_extraction_elapsed = 0.0
+                            st.session_state.vlm_v2_workbook_bytes = b""
                             st.session_state.auto_page_matches = matches
                             st.session_state.page_matches = matches
                             st.session_state.pages_confirmed = False
@@ -1505,18 +1798,33 @@ if is_project_member:
                             }
                             for item in matches:
                                 st.session_state[f"page_edit_{item.table_id}"] = ", ".join(map(str, item.pages))
-                        located_count = sum(bool(item.pages) for item in matches)
-                        if located_count:
-                            st.success(
-                                f"定位完成：{located_count}类目标已找到候选页。"
-                                "请结合右侧页面预览进行校准。"
-                            )
-                        else:
-                            st.warning("尚未自动找到目标页，请查看定位说明或直接填写物理页码。")
-                        if "失败" in locator_message:
-                            st.warning(locator_message)
-                        else:
-                            st.info(locator_message)
+                            located_count = sum(bool(item.pages) for item in matches)
+                            if located_count:
+                                st.success(
+                                    f"定位完成：{located_count}类目标已找到候选页，"
+                                    f"用时{st.session_state.vlm_v2_locator_elapsed:.1f}秒。"
+                                    "请结合右侧PDF原页进行校准并确认。"
+                                )
+                            else:
+                                st.warning("尚未自动找到目标页，请直接填写物理页码。")
+                            if not unresolved_batches.empty:
+                                failed_pages = "、".join(
+                                    unresolved_batches["扫描物理页"].astype(str).tolist()
+                                )
+                                st.warning(
+                                    f"以下页面批次在超时重试后仍未成功：{failed_pages}。"
+                                    "其他批次的定位结果已经保留，请在下方结合PDF原页人工补充。"
+                                )
+                                with st.expander("查看未成功的定位批次", expanded=False):
+                                    st.dataframe(
+                                        unresolved_batches[[
+                                            "批次序号", "扫描物理页", "轮次", "状态", "错误",
+                                        ]],
+                                        width="stretch",
+                                        hide_index=True,
+                                    )
+                        except Exception as exc:
+                            st.error(f"智能定位失败：{exc}")
 
                 if st.session_state.auto_page_matches:
                     st.markdown("---")
@@ -1532,9 +1840,14 @@ if is_project_member:
                     ]
                     if conflict_matches:
                         st.warning(
-                            "以下目标的定位证据存在冲突，已隔离等待人工核对："
+                            "以下目标需要人工核对，具体原因见各目标下方的折叠定位证据："
                             + "、".join(item.table_name for item in conflict_matches)
                         )
+                    saved_locator = st.session_state.vlm_v2_locator_run
+                    if saved_locator is not None and not saved_locator.diagnostics.empty:
+                        with st.expander("查看定位批次与补查记录", expanded=False):
+                            st.caption("请求超时、模型漏回与未命中分别记录；未定位不代表报告未披露。")
+                            st.dataframe(saved_locator.diagnostics, width="stretch", hide_index=True)
                     for match in st.session_state.auto_page_matches:
                         input_key = f"page_edit_{match.table_id}"
                         if input_key not in st.session_state:
@@ -1559,11 +1872,9 @@ if is_project_member:
                                 table_config=match.table_config,
                             )
                         )
-                        auto_text = ", ".join(map(str, match.pages)) if match.pages else "未自动找到"
-                        evidence_text = match.evidence or "无明确关键词证据"
-                        st.caption(f"自动定位：{auto_text}　|　识别依据：{evidence_text}")
+                        render_locator_evidence(match, input_key)
                         if match.review_required:
-                            st.error(f"定位证据冲突：{match.review_reason}")
+                            st.warning("此目标需要人工核对，原因见上方折叠的定位证据。")
                         if invalid_values:
                             st.warning(f"以下页码或内容无效，已忽略：{', '.join(invalid_values)}")
 
@@ -1587,6 +1898,14 @@ if is_project_member:
                         width="stretch",
                     ):
                         st.session_state.pages_confirmed = True
+                        locator_run = st.session_state.vlm_v2_locator_run
+                        if locator_run is not None:
+                            st.session_state.vlm_v2_locator_run = VLMV2LocatorRun(
+                                matches=tuple(updated_matches),
+                                diagnostics=locator_run.diagnostics,
+                                model_calls=locator_run.model_calls,
+                                page_count=locator_run.page_count,
+                            )
                         valid_count = sum(bool(item.pages) for item in updated_matches)
                         conflict_note = (
                             "；定位冲突已由人工确认"
@@ -1645,32 +1964,103 @@ if is_project_member:
     with tabs[2]:
         st.subheader("表格智能转换")
         st.caption(
-            "采用逐页结构化提取：每个物理页独立处理，失败页单独进行图片扫描或网格纠错，"
-            "所有页面成功后再按人工确认的页码顺序确定性拼接；任何一页失败都不会输出残缺跨页表。"
+            "VLM v2从STEP1人工确认的PDF页面直接提取标准指标，完成确定性业务校验，"
+            "并只对失败指标进行一次高清局部重试。"
         )
+
+        with st.expander("VLM v2 批量盲测评分", expanded=False):
+            st.caption(
+                "先运行全部PDF，再读取金标准统一评分；金标准内容不会进入任何模型提示词。"
+                "评分拆分页码、披露状态、标准数值、本季度口径、调用次数和耗时。"
+            )
+            st.download_button(
+                "下载盲测金标准模板",
+                blind_test_template_bytes(),
+                "VLM_v2批量盲测金标准模板.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="vlm_v2_blind_template_download",
+            )
+            blind_gold_upload = st.file_uploader(
+                "上传已填写的盲测金标准",
+                type=["xlsx"],
+                key="vlm_v2_blind_gold_upload",
+            )
+            blind_pdf_uploads = st.file_uploader(
+                "上传未参与开发的公司PDF（可多选）",
+                type=["pdf"],
+                accept_multiple_files=True,
+                key="vlm_v2_blind_pdf_uploads",
+            )
+            if st.button(
+                "运行批量盲测并评分",
+                key="vlm_v2_blind_run",
+                type="primary",
+                disabled=not blind_gold_upload or not blind_pdf_uploads,
+                width="stretch",
+            ):
+                try:
+                    gold_cases = read_blind_gold_workbook(blind_gold_upload.getvalue())
+                    blind_taxonomy = extraction_taxonomy(active_profile, str(taxonomy_path))
+                    blind_configs = [dict(item) for item in active_profile.tables]
+                    scores = []
+                    progress = st.progress(0, text="准备批量盲测…")
+                    for index, uploaded_pdf in enumerate(blind_pdf_uploads, start=1):
+                        pdf_bytes = uploaded_pdf.getvalue()
+                        gold_case = match_blind_case(uploaded_pdf.name, pdf_bytes, gold_cases)
+                        if gold_case is None:
+                            raise ValueError(f"{uploaded_pdf.name} 未在金标准中唯一匹配到样本。")
+                        progress.progress(
+                            (index - 1) / len(blind_pdf_uploads),
+                            text=f"正在处理 {index}/{len(blind_pdf_uploads)}：{uploaded_pdf.name}",
+                        )
+                        started = perf_counter()
+                        blind_locator = locate_tables_vlm_v2(
+                            pdf_bytes, blind_configs, blind_taxonomy,
+                            api_key=st.session_state.llm_api_key,
+                            base_url=st.session_state.llm_base_url,
+                            model=st.session_state.llm_model,
+                        )
+                        blind_extraction = extract_metrics_vlm_v2(
+                            pdf_bytes, blind_locator.matches, blind_configs, blind_taxonomy,
+                            api_key=st.session_state.llm_api_key,
+                            base_url=st.session_state.llm_base_url,
+                            model=st.session_state.llm_model,
+                            auto_retry=True,
+                        )
+                        scores.append(score_blind_case(
+                            gold_case, blind_locator, blind_extraction,
+                            filename=uploaded_pdf.name,
+                            elapsed_seconds=perf_counter() - started,
+                        ))
+                    combined = combine_blind_scores(scores)
+                    st.session_state.vlm_v2_blind_summary = combined.summary
+                    st.session_state.vlm_v2_blind_details = combined.details
+                    st.session_state.vlm_v2_blind_workbook_bytes = blind_scores_workbook_bytes(combined)
+                    progress.progress(1.0, text="批量盲测评分完成")
+                except Exception as exc:
+                    st.error(f"批量盲测失败：{exc}")
+            if not st.session_state.vlm_v2_blind_summary.empty:
+                st.dataframe(st.session_state.vlm_v2_blind_summary, width="stretch", hide_index=True)
+                with st.expander("查看逐项评分明细"):
+                    st.dataframe(dataframe_for_display(st.session_state.vlm_v2_blind_details), width="stretch", hide_index=True)
+                st.download_button(
+                    "下载批量盲测评分结果",
+                    st.session_state.vlm_v2_blind_workbook_bytes,
+                    "VLM_v2批量盲测评分.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    width="stretch",
+                    key="vlm_v2_blind_result_download",
+                )
+
         if not st.session_state.page_matches or not st.session_state.pages_confirmed:
             st.info("请先在 STEP1 上传报告、完成页码定位并人工确认物理页码。")
         else:
-            with st.expander("逐页提取与重试设置", expanded=not bool(st.session_state.raw_tables)):
-                configured_model = st.session_state.get("llm_model", "") or "未设置"
-                st.caption(f"使用登录页中的 AI 设置，当前模型：{configured_model}")
-                option_cols = st.columns(2)
-                with option_cols[0]:
-                    st.toggle(
-                        "单页提取失败时自动图片扫描重试",
-                        key="auto_vision_retry",
-                        help="只重试失败的物理页；模型不支持图片时会改用该页的加强版文本纠错。",
-                    )
-                with option_cols[1]:
-                    st.toggle(
-                        "所有页面直接使用图片扫描模式",
-                        key="force_vision_mode",
-                        help=(
-                            "系统已会自动识别无文字层页面；此开关用于文字层存在但排版异常、"
-                            "仍希望所有已选页强制走图片识别的情况。"
-                        ),
-                    )
-                st.caption("API Key仅保存在当前浏览器会话内，不会写入配置文件或导出的Excel。")
+            configured_model = st.session_state.get("llm_model", "") or "未设置"
+            st.caption(
+                f"使用登录页中的AI设置，当前模型：{configured_model}。"
+                "VLM v2统一处理扫描版和带文字层PDF；单次请求最多4页、90秒，"
+                "接口最多尝试2次；单表超时不影响其他结果，仅重试超时表和未通过校验的指标。"
+            )
 
             if st.button("开始智能提取", type="primary", key="extract_tables"):
                 if not all(
@@ -1682,140 +2072,338 @@ if is_project_member:
                         "Base URL、模型名称和 API Key 后重新进入。"
                     )
                 else:
-                    progress_logs = []
                     try:
+                        st.session_state.vlm_v2_extraction_run = None
+                        st.session_state.vlm_v2_workbook_bytes = b""
+                        st.session_state.ai_workbook_bytes = b""
+                        st.session_state.raw_tables = []
                         extraction_started = perf_counter()
-                        with st.status("正在逐页提取并按页码拼接...", expanded=True) as extraction_status:
-                            log_slot = st.empty()
+                        with st.status("正在从已确认页面提取标准指标...", expanded=True) as extraction_status:
+                            progress_bar = st.progress(
+                                0,
+                                text="正在读取目标指标定义并识别本季度口径...",
+                            )
 
-                            def report_progress(log):
-                                progress_logs.append(log)
-                                log_slot.dataframe(
-                                    extraction_logs_frame(progress_logs),
-                                    width="stretch",
-                                    hide_index=True,
-                                )
+                            def update_extraction_progress(event):
+                                phase = str(event.get("phase", ""))
+                                elapsed = float(event.get("elapsed_seconds", 0.0) or 0.0)
+                                elapsed_text = f"{elapsed:.1f}秒"
+                                if phase == "rendering_started":
+                                    page_count = int(event.get("page_count", 0) or 0)
+                                    progress_bar.progress(
+                                        2,
+                                        text=f"正在统一渲染并缓存{page_count}个物理页 · 已用时{elapsed_text}",
+                                    )
+                                elif phase == "rendering_completed":
+                                    page_count = int(event.get("page_count", 0) or 0)
+                                    progress_bar.progress(
+                                        8,
+                                        text=f"页面缓存完成，共{page_count}页 · 已用时{elapsed_text}",
+                                    )
+                                elif phase == "initial_started":
+                                    total = int(event.get("total_tables", 0) or 0)
+                                    progress_bar.progress(
+                                        10,
+                                        text=f"开始首轮提取，共{total}张目标表 · 已用时{elapsed_text}",
+                                    )
+                                elif phase == "initial_completed":
+                                    completed = int(event.get("completed_tables", 0) or 0)
+                                    total = max(1, int(event.get("total_tables", 0) or 0))
+                                    table_name = str(event.get("table_name", "目标表"))
+                                    percent = min(70, 10 + round(60 * completed / total))
+                                    progress_bar.progress(
+                                        percent,
+                                        text=f"首轮已完成 {completed}/{total}：{table_name} · 已用时{elapsed_text}",
+                                    )
+                                    extraction_status.write(
+                                        f"首轮完成 {completed}/{total}：{table_name}（{elapsed_text}）"
+                                    )
+                                elif phase == "initial_failed":
+                                    completed = int(event.get("completed_tables", 0) or 0)
+                                    total = max(1, int(event.get("total_tables", 0) or 0))
+                                    table_name = str(event.get("table_name", "目标表"))
+                                    status = str(event.get("status", "失败"))
+                                    percent = min(70, 10 + round(60 * completed / total))
+                                    progress_bar.progress(
+                                        percent,
+                                        text=(
+                                            f"首轮已处理 {completed}/{total}：{table_name}{status}，"
+                                            f"其他表继续 · 已用时{elapsed_text}"
+                                        ),
+                                    )
+                                    extraction_status.write(
+                                        f"首轮{status} {completed}/{total}：{table_name}；"
+                                        f"已保留其他成功结果（{elapsed_text}）"
+                                    )
+                                elif phase == "timeout_retry_started":
+                                    names = "、".join(event.get("retry_table_names", []))
+                                    progress_bar.progress(
+                                        70,
+                                        text=f"仅重试首轮失败请求批次：{names} · 已用时{elapsed_text}",
+                                    )
+                                    extraction_status.write(
+                                        f"开始重试失败请求批次：{names}（{elapsed_text}）"
+                                    )
+                                elif phase == "timeout_retry_completed":
+                                    completed = int(event.get("completed_retries", 0) or 0)
+                                    total = max(1, int(event.get("retry_total", 0) or 0))
+                                    table_name = str(event.get("table_name", "目标表"))
+                                    progress_bar.progress(
+                                        71,
+                                        text=(
+                                            f"失败请求重试成功 {completed}/{total}：{table_name}"
+                                            f" · 已用时{elapsed_text}"
+                                        ),
+                                    )
+                                    extraction_status.write(
+                                        f"失败请求重试成功 {completed}/{total}：{table_name}（{elapsed_text}）"
+                                    )
+                                elif phase == "timeout_retry_failed":
+                                    completed = int(event.get("completed_retries", 0) or 0)
+                                    total = max(1, int(event.get("retry_total", 0) or 0))
+                                    table_name = str(event.get("table_name", "目标表"))
+                                    status = str(event.get("status", "失败"))
+                                    progress_bar.progress(
+                                        71,
+                                        text=(
+                                            f"失败请求重试{status} {completed}/{total}：{table_name}；"
+                                            f"将保留其他结果 · 已用时{elapsed_text}"
+                                        ),
+                                    )
+                                    extraction_status.write(
+                                        f"失败请求重试{status}：{table_name}；其他成功结果不受影响"
+                                        f"（{elapsed_text}）"
+                                    )
+                                elif phase == "validation_completed":
+                                    retry_total = int(event.get("retry_total", 0) or 0)
+                                    text = (
+                                        f"业务校验完成，需要定向重试{retry_total}张表"
+                                        if retry_total else "业务校验完成，无需重试"
+                                    )
+                                    progress_bar.progress(72, text=f"{text} · 已用时{elapsed_text}")
+                                    extraction_status.write(f"{text}（{elapsed_text}）")
+                                elif phase == "retry_started":
+                                    names = "、".join(event.get("retry_table_names", []))
+                                    progress_bar.progress(
+                                        74,
+                                        text=f"正在受控并行重试：{names} · 已用时{elapsed_text}",
+                                    )
+                                elif phase == "retry_completed":
+                                    completed = int(event.get("completed_retries", 0) or 0)
+                                    total = max(1, int(event.get("retry_total", 0) or 0))
+                                    table_name = str(event.get("table_name", "目标表"))
+                                    percent = min(96, 74 + round(22 * completed / total))
+                                    progress_bar.progress(
+                                        percent,
+                                        text=f"重试已完成 {completed}/{total}：{table_name} · 已用时{elapsed_text}",
+                                    )
+                                    extraction_status.write(
+                                        f"定向重试完成 {completed}/{total}：{table_name}（{elapsed_text}）"
+                                    )
+                                elif phase == "retry_failed":
+                                    completed = int(event.get("completed_retries", 0) or 0)
+                                    total = max(1, int(event.get("retry_total", 0) or 0))
+                                    table_name = str(event.get("table_name", "目标表"))
+                                    status = str(event.get("status", "失败"))
+                                    percent = min(96, 74 + round(22 * completed / total))
+                                    progress_bar.progress(
+                                        percent,
+                                        text=(
+                                            f"定向重试{status} {completed}/{total}：{table_name}；"
+                                            f"保留首轮结果 · 已用时{elapsed_text}"
+                                        ),
+                                    )
+                                    extraction_status.write(
+                                        f"定向重试{status}：{table_name}；已保留首轮结果"
+                                        f"（{elapsed_text}）"
+                                    )
+                                elif phase == "completed":
+                                    progress_bar.progress(
+                                        100,
+                                        text=f"提取与业务校验全部完成 · 总用时{elapsed_text}",
+                                    )
 
-                            bundle = extract_tables_hybrid(
+                            vlm_v2_taxonomy = extraction_taxonomy(active_profile, str(taxonomy_path))
+                            vlm_table_configs = [
+                                dict(item.table_config)
+                                for item in st.session_state.page_matches
+                            ]
+                            extraction_run = extract_metrics_vlm_v2(
                                 st.session_state.pdf_bytes,
                                 st.session_state.page_matches,
+                                vlm_table_configs,
+                                vlm_v2_taxonomy,
                                 api_key=st.session_state.llm_api_key,
                                 base_url=st.session_state.llm_base_url,
                                 model=st.session_state.llm_model,
-                                auto_vision_retry=st.session_state.auto_vision_retry,
-                                force_vision=st.session_state.force_vision_mode,
-                                progress_callback=report_progress,
-                                _shared_grid_cache=st.session_state.extraction_grid_cache,
-                                _shared_image_cache=st.session_state.extraction_image_cache,
-                                _cache_lock=st.session_state.extraction_cache_lock,
+                                timeout=90,
+                                request_max_attempts=2,
+                                auto_retry=True,
+                                max_workers=3,
+                                retry_max_workers=2,
+                                max_pages_per_request=4,
+                                progress_callback=update_extraction_progress,
                             )
                             extraction_elapsed = perf_counter() - extraction_started
-                            st.session_state.raw_tables = bundle.tables
-                            st.session_state.ai_extraction_logs = bundle.logs
-                            st.session_state.ai_workbook_bytes = reconstructed_workbook_bytes(bundle)
+                            step3_gate = evaluate_vlm_v2_step3_gate(extraction_run)
+                            st.session_state.vlm_v2_extraction_run = extraction_run
+                            st.session_state.vlm_v2_extraction_elapsed = extraction_elapsed
+                            st.session_state.vlm_v2_workbook_bytes = vlm_v2_workbook_bytes(
+                                st.session_state.vlm_v2_locator_run,
+                                extraction_run,
+                                report_metadata=st.session_state.metadata,
+                                source_filename=st.session_state.pdf_name,
+                            )
+                            st.session_state.ai_workbook_bytes = st.session_state.vlm_v2_workbook_bytes
+                            st.session_state.ai_extraction_logs = []
+                            st.session_state.raw_tables = (
+                                vlm_v2_to_extracted_tables(extraction_run)
+                                if step3_gate.passed else []
+                            )
                             st.session_state.table_candidates = {}
                             st.session_state.selected_table_candidates = {}
                             st.session_state.standard_data = pd.DataFrame(columns=STANDARD_COLUMNS)
                             st.session_state.validation_results = pd.DataFrame()
                             st.session_state.normalization_diagnostics = pd.DataFrame()
-
-                            failed = [item for item in bundle.logs if item.status == "失败"]
-                            if bundle.tables:
+                            if step3_gate.passed:
                                 extraction_status.update(
                                     label=(
-                                        f"智能提取完成：生成 {len(bundle.tables)} 张标准化中间表"
-                                        f"，用时 {extraction_elapsed:.1f} 秒"
+                                        f"智能提取完成：STEP3前置门槛已通过，"
+                                        f"用时{extraction_elapsed:.1f}秒"
                                     ),
                                     state="complete",
                                     expanded=False,
                                 )
                             else:
                                 extraction_status.update(
-                                    label=f"智能提取未生成可用表格，用时 {extraction_elapsed:.1f} 秒",
+                                    label=(
+                                        f"指标提取完成，但仍有校验项未通过，"
+                                        f"用时{extraction_elapsed:.1f}秒"
+                                    ),
                                     state="error",
                                     expanded=True,
                                 )
-                            if failed:
-                                st.warning(f"仍有 {len(failed)} 次最终提取失败，请查看下方提取日志。")
                     except Exception as exc:
-                        st.session_state.ai_extraction_logs = progress_logs
                         st.error(f"智能提取中止：{exc}")
 
-        if st.session_state.ai_extraction_logs:
-            st.markdown("##### 提取与重试日志")
-            st.dataframe(
-                extraction_logs_frame(st.session_state.ai_extraction_logs),
-                width="stretch",
-                hide_index=True,
-            )
+        extraction_run = st.session_state.vlm_v2_extraction_run
+        if extraction_run is not None:
+            refreshed_run = refresh_vlm_v2_cross_table_checks(extraction_run)
+            if refreshed_run is not extraction_run:
+                extraction_run = refreshed_run
+                st.session_state.vlm_v2_extraction_run = extraction_run
+                st.session_state.vlm_v2_workbook_bytes = vlm_v2_workbook_bytes(
+                    st.session_state.vlm_v2_locator_run, extraction_run,
+                    report_metadata=st.session_state.metadata,
+                    source_filename=st.session_state.pdf_name,
+                )
+                st.session_state.ai_workbook_bytes = st.session_state.vlm_v2_workbook_bytes
+                if evaluate_vlm_v2_step3_gate(extraction_run).passed:
+                    st.session_state.raw_tables = vlm_v2_to_extracted_tables(extraction_run)
+            step3_gate = evaluate_vlm_v2_step3_gate(extraction_run)
+            found_count = int(
+                extraction_run.records["状态"].isin({"found", "disclosed_zero"}).sum()
+            ) if not extraction_run.records.empty else 0
+            failed_count = int(
+                (extraction_run.validations["状态"] == "失败").sum()
+            ) if not extraction_run.validations.empty else 0
 
-        if st.session_state.raw_tables:
-            tables = st.session_state.raw_tables
+            st.markdown("### 📊 提取结果预览")
+            if st.session_state.ai_workbook_bytes:
+                original_pdf_stem = re.sub(
+                    r'[\\/:*?"<>|]+',
+                    "_",
+                    Path(st.session_state.pdf_name or "").stem,
+                ).strip(" ._")
+                step2_download_name = "偿付能力报告_STEP2结构化提取.xlsx"
+                if original_pdf_stem:
+                    step2_download_name = (
+                        f"偿付能力报告_STEP2结构化提取_{original_pdf_stem[:80]}.xlsx"
+                    )
+                st.download_button(
+                    "一键下载结构化提取表（Excel）",
+                    st.session_state.ai_workbook_bytes,
+                    step2_download_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    icon=":material/download:",
+                    width="stretch",
+                    key="download_step2_vlm_result",
+                )
+
+            records = extraction_run.records.copy()
+            if not records.empty:
+                preview_tabs = []
+                preview_groups = []
+                for table_id, group in records.groupby("目标表ID", sort=False):
+                    table_name = str(group.iloc[0]["目标表名称"] or table_id)
+                    preview_tabs.append(table_name)
+                    preview_groups.append(group)
+                for table_tab, group in zip(st.tabs(preview_tabs), preview_groups):
+                    with table_tab:
+                        preview = group[[
+                            "指标编码", "指标名称", "状态", "原始值", "单位",
+                            "标准数值", "标准单位", "期间口径", "物理页码",
+                            "原始标签", "证据原文",
+                        ]].copy()
+                        preview["状态"] = preview["状态"].map({
+                            "found": "已披露",
+                            "disclosed_zero": "0",
+                            "disclosed_na": "不适用",
+                            "not_disclosed": "未披露",
+                        }).fillna(preview["状态"])
+                        st.dataframe(
+                            dataframe_for_display(preview),
+                            width="stretch",
+                            hide_index=True,
+                            height=min(720, 140 + len(preview) * 36),
+                            column_config={
+                                "标准数值": st.column_config.NumberColumn(format="%.6g"),
+                                "物理页码": st.column_config.NumberColumn(format="%d"),
+                            },
+                        )
+
+            with st.expander("查看提取质量与STEP3前置门槛", expanded=not step3_gate.passed):
+                result_metrics = st.columns(4)
+                result_metrics[0].metric("可用指标", found_count)
+                result_metrics[1].metric("校验失败项", failed_count)
+                result_metrics[2].metric(
+                    "模型调用",
+                    f"{extraction_run.model_calls}（重试{extraction_run.retry_calls}）",
+                )
+                result_metrics[3].metric(
+                    "提取耗时",
+                    f"{st.session_state.vlm_v2_extraction_elapsed:.1f}秒",
+                )
+                if step3_gate.passed:
+                    st.success(step3_gate.summary)
+                else:
+                    st.error(step3_gate.summary)
+                st.dataframe(step3_gate.checks, width="stretch", hide_index=True)
+                validation_view = extraction_run.validations.copy()
+                if not validation_view.empty:
+                    validation_view["_排序"] = validation_view["状态"].map(
+                        {"失败": 0, "通过": 1}
+                    ).fillna(2)
+                    validation_view = validation_view.sort_values("_排序").drop(columns="_排序")
+                    st.dataframe(dataframe_for_display(validation_view), width="stretch", hide_index=True)
+                if extraction_run.logs:
+                    st.caption("　".join(extraction_run.logs))
+
             gold_case = find_gold_case(
                 st.session_state.pdf_bytes,
                 read_gold_manifest(),
             )
             if gold_case:
-                with st.expander("真实PDF金标准 - 表格提取结果", expanded=True):
+                with st.expander("真实PDF金标准 - 指标提取结果"):
                     st.dataframe(
-                        evaluate_gold_case(
+                        vlm_v2_gold_evaluation(
                             gold_case,
-                            matches=st.session_state.page_matches,
-                            tables=tables,
+                            st.session_state.vlm_v2_locator_run,
+                            extraction_run,
                         ),
                         width="stretch",
                         hide_index=True,
                     )
-
-            def format_reconstructed_table(index: int) -> str:
-                item = tables[index]
-                pages = item.source_pages or [item.page]
-                page_label = "、".join(map(str, pages))
-                return f"{item.table_name} - 第{page_label}页 - {item.strategy}"
-
-            selected_table_index = st.selectbox(
-                "标准化中间表预览",
-                range(len(tables)),
-                format_func=format_reconstructed_table,
-                key="ai_table_preview",
-            )
-            selected_table = tables[selected_table_index]
-            source_pages = selected_table.source_pages or [selected_table.page]
-
-            metric_cols = st.columns(3)
-            metric_cols[0].metric("处理方式", selected_table.strategy)
-            metric_cols[1].metric("来源页数", len(source_pages))
-            metric_cols[2].metric("质量评分", f"{selected_table.quality_score:.1f}")
-            if selected_table.evidence:
-                st.caption(f"自动校验依据：{selected_table.evidence}")
-
-            table_col, pdf_col = st.columns([1.15, 1], gap="large")
-            with table_col:
-                st.markdown("##### 网格化重构结果")
-                st.dataframe(selected_table.to_frame(include_unit_footer=True), width="stretch", hide_index=True)
-            with pdf_col:
-                selected_source_page = st.selectbox(
-                    "PDF原页核实",
-                    source_pages,
-                    format_func=lambda value: f"第 {value} 页",
-                    key=f"ai_source_page_{selected_table.table_id}",
-                )
-                try:
-                    st.image(
-                        render_pdf_page(st.session_state.pdf_bytes, selected_source_page),
-                        caption=f"PDF物理第 {selected_source_page} 页",
-                        width="stretch",
-                    )
-                except Exception as exc:
-                    st.warning(f"PDF页面预览失败：{exc}")
-
-            if st.session_state.ai_workbook_bytes:
-                st.download_button(
-                    "下载STEP2标准化提取Excel",
-                    st.session_state.ai_workbook_bytes,
-                    "偿付能力报告_STEP2标准化提取.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
 
     with tabs[3]:
         st.subheader(f"{active_profile.profile_name}目标表标准填报")
@@ -1825,6 +2413,72 @@ if is_project_member:
                 "按目标指标清单将 STEP2 提取结果填入标准窄表，并自动完成单位换算与派生指标计算。"
                 "输出字段和可用指标范围与 STEP5 的精确映射口径完全一致。"
             )
+
+        step3_source_mode = st.segmented_control(
+            "STEP3 输入来源",
+            ["使用 STEP2 提取结果", "上传本地提取表格"],
+            default="使用 STEP2 提取结果",
+            key="step3_source_mode",
+            help=(
+                "可沿用本次VLM v2正式提取结果，或上传本地STEP2结构化提取Excel。"
+            ),
+        )
+        uploaded_source_file = None
+        uploaded_source_pdf = None
+        if step3_source_mode == "上传本地提取表格":
+            uploaded_source_file = st.file_uploader(
+                "上传 STEP2 标准化提取 Excel",
+                type=["xlsx"],
+                key="step3_source_upload",
+                help=(
+                    "需使用 STEP2 下载的“STEP2标准化提取.xlsx”，"
+                    "或与其工作表结构一致的提取表格。"
+                ),
+            )
+            uploaded_source_pdf = st.file_uploader(
+                "原始报告 PDF（用于核对保单未来盈余披露，可选）",
+                type=["pdf"],
+                key="step3_source_pdf_upload",
+                help="上传与 STEP2 表格对应的原始 PDF，可纠正旧提取结果中误判为零的未列示子项。",
+            )
+        uploaded_source_bytes = (
+            uploaded_source_file.getvalue() if uploaded_source_file is not None else b""
+        )
+        vlm_step3_gate = evaluate_vlm_v2_step3_gate(
+            st.session_state.vlm_v2_extraction_run
+        ) if step3_source_mode == "使用 STEP2 提取结果" else None
+        source_read_error = ""
+        if step3_source_mode == "使用 STEP2 提取结果":
+            source_tables = st.session_state.raw_tables
+        else:
+            source_tables = []
+            if uploaded_source_file is not None:
+                try:
+                    source_tables = read_extracted_tables_workbook(
+                        uploaded_source_bytes, active_profile.tables,
+                    )
+                    if not source_tables:
+                        source_read_error = (
+                            "文件已上传，但未找到可填报的指标数据。请上传 STEP2 下载的完整结构化提取 Excel；"
+                            "支持 VLM v2 指标结果和旧版逐表工作簿。"
+                        )
+                except Exception as exc:
+                    source_read_error = f"上传文件读取失败：{exc}"
+        source_file_name = (
+            uploaded_source_file.name
+            if step3_source_mode == "上传本地提取表格" and uploaded_source_file is not None
+            else st.session_state.pdf_name
+        ) or "本地提取"
+        source_basename = Path(source_file_name).stem
+        current_pdf_name = st.session_state.pdf_name or ""
+        if step3_source_mode == "使用 STEP2 提取结果":
+            source_pdf_bytes = st.session_state.pdf_bytes
+        elif uploaded_source_pdf is not None:
+            source_pdf_bytes = uploaded_source_pdf.getvalue()
+        elif current_pdf_name and Path(current_pdf_name).stem in source_basename:
+            source_pdf_bytes = st.session_state.pdf_bytes
+        else:
+            source_pdf_bytes = b""
 
         include_derived = active_profile.profile_id == "LIFE_SOLVENCY"
         taxonomy = (
@@ -1837,13 +2491,23 @@ if is_project_member:
         system_target_catalog = step3_metric_catalog(
             taxonomy,
             include_derived=include_derived,
+            use_checklists=active_profile.profile_id == 'LIFE_SOLVENCY',
         )
+
+        if vlm_step3_gate is not None:
+            with st.container(border=True):
+                st.markdown("#### STEP2 前置质量门槛")
+                if vlm_step3_gate.passed:
+                    st.success(vlm_step3_gate.summary)
+                else:
+                    st.error(vlm_step3_gate.summary)
+                st.dataframe(vlm_step3_gate.checks, width="stretch", hide_index=True)
 
         use_default_target = st.toggle(
             "使用系统默认目标表",
             value=True,
             key="step3_use_default_target",
-            help="默认目标表直接引用 STEP5 当前可映射指标目录。关闭后可上传自定义指标子集。",
+            help="默认目标表按填报清单列出披露指标，并保留系统派生指标；无对应披露的指标也会保留在标准窄表中。",
         )
         target_upload = None
         if use_default_target:
@@ -1876,21 +2540,160 @@ if is_project_member:
             PEER_GROUP_CONFIG,
             PEER_GROUP_CONFIG.stat().st_mtime_ns,
         )
+
+        step3_company_name = ""
+        step3_report_period = ""
+        step3_peer_group_override = ""
+        step3_company_type = company_type
+        step3_detected_metadata = None
+        company_items = tuple(
+            (str(row.get("公司", "")), str(row.get("公司类别", "")))
+            for row in companies.to_dict("records")
+        )
+        if step3_source_mode == "上传本地提取表格":
+            source_key = (
+                hashlib.sha256(uploaded_source_bytes).hexdigest()[:12]
+                if uploaded_source_bytes
+                else "empty"
+            )
+            if uploaded_source_bytes and not source_read_error:
+                step3_detected_metadata = read_step3_upload_metadata(
+                    uploaded_source_bytes,
+                    source_file_name,
+                    company_items,
+                    tuple(sorted(peer_group_map.items())),
+                    default_peer_group,
+                    tuple(
+                        (key, str(st.session_state.metadata.get(key, "") or ""))
+                        for key in ("公司", "报告年度", "报告季度", "报告期")
+                    ),
+                    st.session_state.pdf_name,
+                )
+        else:
+            source_key = (
+                hashlib.sha256(source_pdf_bytes).hexdigest()[:12]
+                if source_pdf_bytes
+                else hashlib.sha256(source_file_name.encode("utf-8")).hexdigest()[:12]
+            )
+            step3_detected_metadata = infer_step3_session_metadata(
+                st.session_state.metadata,
+                source_file_name,
+                tuple(
+                    {"company_name": name, "company_type": item_type}
+                    for name, item_type in company_items
+                ),
+                peer_group_map=peer_group_map,
+                default_peer_group=default_peer_group,
+            )
+        if step3_detected_metadata is not None:
+            step3_company_type = step3_detected_metadata.company_type or company_type
+
+        with st.container(border=True):
+            st.markdown("#### 报告元信息自动识别")
+            if step3_source_mode == "上传本地提取表格":
+                st.caption(
+                    "系统优先读取工作簿内嵌的报告元信息；若其报告期与原PDF及上传文件名"
+                    "共同指向的季度冲突，则采用一致的来源期间。也兼容表内季度或期末日期。"
+                    "识别结果仍可人工修改。"
+                )
+            else:
+                st.caption("系统优先采用PDF识别结果；缺失时根据PDF文件名补全。请核对后填报。")
+            if step3_detected_metadata is not None:
+                for warning in step3_detected_metadata.warnings:
+                    st.warning(warning)
+            else:
+                st.info("上传 STEP2 标准化提取 Excel 后将自动识别。")
+            mode_key = "upload" if step3_source_mode == "上传本地提取表格" else "step2"
+            company_widget_key = f"step3_company_name_{mode_key}_{source_key}"
+            period_widget_key = f"step3_report_period_{mode_key}_{source_key}"
+            peer_group_widget_key = f"step3_peer_group_{mode_key}_{source_key}"
+            metadata_signature_key = f"step3_metadata_signature_v3_{mode_key}_{source_key}"
+            metadata_values_key = f"step3_metadata_values_{mode_key}_{source_key}"
+            detected_company = (
+                step3_detected_metadata.company if step3_detected_metadata else ""
+            )
+            detected_period = (
+                step3_detected_metadata.report_period if step3_detected_metadata else ""
+            )
+            detected_peer_group = (
+                step3_detected_metadata.peer_group if step3_detected_metadata else ""
+            )
+            detected_signature = (detected_company, detected_period, detected_peer_group)
+            if (
+                st.session_state.get(metadata_signature_key) != detected_signature
+                or metadata_values_key not in st.session_state
+            ):
+                st.session_state[metadata_values_key] = {
+                    company_widget_key: detected_company,
+                    period_widget_key: detected_period,
+                    peer_group_widget_key: detected_peer_group or "自动匹配（按公司名称）",
+                }
+                for widget_key, value in st.session_state[metadata_values_key].items():
+                    st.session_state[widget_key] = value
+                st.session_state[metadata_signature_key] = detected_signature
+            # Widget keys disappear when switching input modes; retain reviewed values.
+            for widget_key, value in st.session_state[metadata_values_key].items():
+                st.session_state.setdefault(widget_key, value)
+            meta_col1, meta_col2, meta_col3 = st.columns(3)
+            with meta_col1:
+                step3_company_name = st.text_input(
+                    "公司名称",
+                    key=company_widget_key,
+                    help="用于反查公司标准名称、统一编码与同业分类。",
+                ).strip()
+            with meta_col2:
+                step3_report_period = st.text_input(
+                    "报告期",
+                    key=period_widget_key,
+                    placeholder="如 2026Q2",
+                    help="报告期，如 2026Q2、2026年2季度。",
+                ).strip()
+            with meta_col3:
+                peer_group_choices = sorted(
+                    {group for group in peer_group_map.values() if group}
+                    | ({default_peer_group} if default_peer_group else set())
+                )
+                peer_group_options = ["自动匹配（按公司名称）", *peer_group_choices]
+                if st.session_state.get(peer_group_widget_key) not in peer_group_options:
+                    st.session_state[peer_group_widget_key] = "自动匹配（按公司名称）"
+                step3_peer_group = st.selectbox(
+                    "同业分类",
+                    peer_group_options,
+                    key=peer_group_widget_key,
+                    help="默认按公司名称自动匹配；匹配不到时可手动指定。",
+                )
+                step3_peer_group_override = (
+                    "" if step3_peer_group.startswith("自动匹配") else step3_peer_group
+                )
+            st.session_state[metadata_values_key] = {
+                company_widget_key: step3_company_name,
+                period_widget_key: step3_report_period,
+                peer_group_widget_key: step3_peer_group,
+            }
+
         standardize_submitted = st.button(
             "启动目标表标准填报",
             type="primary",
             icon=":material/auto_fix_high:",
             disabled=(
-                not st.session_state.raw_tables
+                not source_tables
+                or not step3_company_name
                 or (not use_default_target and target_upload is None)
             ),
             key="step3_standardize_target",
         )
 
-        if not st.session_state.raw_tables:
-            st.info("请先在 STEP2 完成表格提取。")
+        if not source_tables:
+            if source_read_error:
+                st.error(source_read_error)
+            elif step3_source_mode == "上传本地提取表格":
+                st.info("请上传 STEP2 标准化提取 Excel，或切回“使用 STEP2 提取结果”。")
+            else:
+                st.info("请先在STEP2完成VLM v2提取并通过全部前置门槛。")
         elif not use_default_target and target_upload is None:
             st.info("请上传自定义目标表，或切回系统默认目标表。")
+        elif not step3_company_name:
+            st.warning("请先在上方“报告元信息自动识别”中填写公司名称。")
 
         if standardize_submitted:
             st.session_state.standard_data = pd.DataFrame(columns=STANDARD_COLUMNS)
@@ -1915,25 +2718,47 @@ if is_project_member:
                         template_label = target_upload.name
 
                     status_box.write("正在匹配披露指标、识别期间口径并统一计量单位…")
-                    metadata = {
-                        **st.session_state.metadata,
-                        "来源文件": st.session_state.pdf_name,
-                        "导入批次": (
-                            f"{Path(st.session_state.pdf_name).stem}:"
-                            f"{st.session_state.metadata.get('报告期', '')}"
-                        ),
-                    }
+                    effective_period = st.session_state.metadata.get("报告期", "")
+                    metadata = dict(st.session_state.metadata)
+                    if step3_source_mode == "上传本地提取表格":
+                        metadata = (
+                            step3_detected_metadata.to_metadata()
+                            if step3_detected_metadata is not None
+                            else {}
+                        )
+                        effective_period = str(metadata.get("报告期", "") or "")
+                    elif step3_detected_metadata is not None:
+                        metadata.update(step3_detected_metadata.to_metadata())
+                        effective_period = str(metadata.get("报告期", "") or "")
+                    # A cleared/stale widget must not erase a recognized company.
+                    metadata["公司"] = (
+                        step3_company_name or str(metadata.get("公司", "") or "").strip()
+                    )
+                    if step3_report_period:
+                        period_year, period_quarter, normalized_period = normalize_report_period(
+                            step3_report_period
+                        )
+                        effective_period = normalized_period or step3_report_period
+                        metadata["报告期"] = effective_period
+                        metadata["报告年度"] = period_year
+                        metadata["报告季度"] = period_quarter
+                    if not str(metadata.get("公司", "") or "").strip():
+                        raise ValueError("公司名称尚未识别，请在报告元信息中补充公司名称后再填报。")
+                    metadata["来源文件"] = source_file_name
+                    metadata["导入批次"] = f"{source_basename}:{effective_period}"
                     result = standardize_to_target(
-                        st.session_state.raw_tables,
+                        source_tables,
                         taxonomy,
                         metadata,
-                        company_type,
+                        step3_company_type,
                         target_catalog,
                         report_profile_id=active_profile.profile_id,
                         allowed_company_types=active_profile.company_types,
+                        peer_group=step3_peer_group_override,
                         peer_group_map=peer_group_map,
                         default_peer_group=default_peer_group,
                         include_derived=include_derived,
+                        source_pdf_bytes=source_pdf_bytes,
                         template_warnings=template_warnings,
                     )
 
@@ -1961,7 +2786,7 @@ if is_project_member:
         if not st.session_state.standard_target_summary.empty:
             summary = st.session_state.standard_target_summary
             filled_targets = int((summary["填报状态"] == "已填报").sum())
-            missing_targets = int((summary["填报状态"] == "未填报").sum())
+            missing_targets = int(summary['填报状态'].isin({'未披露', '无法计算', '未填报'}).sum())
             with st.container(horizontal=True):
                 st.metric("目标指标", len(summary), border=True)
                 st.metric("已填报指标", filled_targets, border=True)
@@ -1973,7 +2798,7 @@ if is_project_member:
             if missing_targets:
                 with st.expander("查看未填报目标指标", expanded=True):
                     st.dataframe(
-                        summary[summary["填报状态"] == "未填报"],
+                        summary[summary['填报状态'].isin({'未披露', '无法计算', '未填报'})],
                         width="stretch",
                         hide_index=True,
                     )
@@ -2007,14 +2832,23 @@ if is_project_member:
                 st.metric("单位换算记录", converted_rows, border=True)
                 st.metric("单位待核对记录", pending_unit_rows, border=True)
             st.markdown("#### 标准窄表预览")
-            st.dataframe(st.session_state.standard_data, width="stretch", hide_index=True)
+            st.caption(
+                "页面预览显示已计算数值；下载后的 Excel 会在系统计算指标的“数值”单元格中保留公式，"
+                "并提供“计算依据”工作表用于追溯。未取得的披露指标在数值单元格显示“未披露”；原表横杠及数字0均按0处理。"
+            )
+            step3_narrow_display = narrow_table_view(st.session_state.standard_data)
+            # The preview column contains numbers and disclosure text; keep the
+            # mixed display Arrow-safe without changing numeric Excel cells.
+            step3_narrow_display['数值'] = step3_narrow_display['数值'].map(
+                lambda value: '' if pd.isna(value) else str(value))
+            st.dataframe(dataframe_for_display(step3_narrow_display), width="stretch", hide_index=True)
             st.download_button(
                 "下载已填报的标准窄表",
                 (
                     st.session_state.standard_workbook_bytes
-                    or dataframe_to_xlsx(st.session_state.standard_data, "标准数据")
+                    or standard_workbook_bytes(st.session_state.standard_data)
                 ),
-                f"{Path(st.session_state.pdf_name).stem}_STEP3标准窄表.xlsx",
+                f"{source_basename}_STEP3标准窄表.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 icon=":material/download:",
             )
@@ -2023,8 +2857,10 @@ if is_project_member:
     with tabs[4]:
         st.subheader(f"{active_profile.profile_name}勾稽检查")
         st.caption(
-            "检查 STEP3 标准窄表的数据规范、六项关键指标完整性、公式勾稽和跨表一致性；"
-            "检查过程只读，不会自动修改标准化结果。"
+            "数据规范检查覆盖 STEP3 标准窄表全部记录；六项关键指标完整性、公式勾稽和"
+            "跨表一致性仅检查当前期末组（本季度末数、期末数、本季度（末）数）。"
+            "检查过程只读，不会自动修改标准化结果；下载工作簿会接续保留 STEP3 公式，"
+            "并附带检查公式、Excel 差异及容差复核。"
         )
         if st.session_state.standard_data.empty:
             st.info("请先完成 STEP3 标准化。")
@@ -2096,9 +2932,10 @@ if is_project_member:
                 validation_results["status"].astype(str).isin(selected_statuses)
                 & validation_results["check_type"].astype(str).isin(selected_types)
             ].copy()
+            display_results = validation_display_frame(filtered_results)
             display_columns = {
                 "check_type": "检查类别",
-                "severity": "严重程度",
+                "severity": "未通过时级别",
                 "rule_name": "规则名称",
                 "company": "公司",
                 "report_period": "报告期",
@@ -2114,7 +2951,7 @@ if is_project_member:
                 "suggestion": "处理建议",
             }
             st.dataframe(
-                filtered_results[list(display_columns)].rename(columns=display_columns),
+                display_results[list(display_columns)].rename(columns=display_columns),
                 width="stretch",
                 hide_index=True,
                 column_config={
@@ -2126,7 +2963,13 @@ if is_project_member:
             )
             st.download_button(
                 "下载勾稽检查工作簿",
-                validation_results_to_xlsx(validation_results),
+                validation_results_to_xlsx(
+                    validation_results,
+                    (
+                        st.session_state.standard_workbook_bytes
+                        or standard_workbook_bytes(st.session_state.standard_data)
+                    ),
+                ),
                 "偿付能力_STEP4勾稽检查结果.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 icon=":material/download:",
@@ -2157,11 +3000,17 @@ if is_project_member:
             if uploads and st.button(
                 "读取并预览标准窄表", type="primary", key="preview_standard_data"
             ):
+                integration_started = perf_counter()
+                integration_progress = st.progress(0.0, text=f"准备读取 {len(uploads)} 个文件…")
                 try:
                     frames = []
                     summaries = []
                     skipped_profiles: set[str] = set()
-                    for upload in uploads:
+                    for file_index, upload in enumerate(uploads, start=1):
+                        integration_progress.progress(
+                            (file_index - 1) / (len(uploads) + 1),
+                            text=f"正在读取 {file_index}/{len(uploads)}：{upload.name} · 已耗时 {perf_counter() - integration_started:.1f} 秒",
+                        )
                         standardized = cached_read_standard_workbook(
                             upload.getvalue(), upload.name
                         )
@@ -2189,10 +3038,17 @@ if is_project_member:
                             "数据类型": "标准窄表",
                             "记录数": len(standardized),
                         })
+                        integration_progress.progress(
+                            file_index / (len(uploads) + 1),
+                            text=f"已读取 {file_index}/{len(uploads)} 个文件 · 已耗时 {perf_counter() - integration_started:.1f} 秒",
+                        )
                     integration_preview = (
                         pd.concat(frames, ignore_index=True)
                         if frames
                         else pd.DataFrame(columns=STANDARD_COLUMNS)
+                    )
+                    integration_progress.progress(
+                        len(uploads) / (len(uploads) + 1), text="文件读取完成，正在合并并补充可计算指标…"
                     )
                     st.session_state.integration_preview = (
                         cached_complete_step5_metrics(integration_preview)
@@ -2208,7 +3064,11 @@ if is_project_member:
                         else []
                     )
                     st.session_state.integration_preview_mode = "标准窄表"
+                    integration_progress.progress(
+                        1.0, text=f"集成预览完成：{len(uploads)} 个文件，{len(st.session_state.integration_preview):,} 条记录 · 共 {perf_counter() - integration_started:.1f} 秒"
+                    )
                 except Exception as exc:
+                    integration_progress.empty()
                     st.error(f"标准窄表读取失败：{exc}")
         else:
             if active_profile.profile_id != "LIFE_SOLVENCY":
@@ -2320,7 +3180,11 @@ if is_project_member:
                 f"转换后共 {len(preview):,} 条窄表记录。确认后将替换当前集成数据，"
                 "不与其他接入方式并行合并。"
             )
-            st.dataframe(preview.head(1000), width="stretch", hide_index=True)
+            st.dataframe(
+                dataframe_for_display(narrow_table_view(preview.head(1000))),
+                width="stretch",
+                hide_index=True,
+            )
             if st.button(
                 "确认采用该数据集",
                 type="primary",
@@ -2336,15 +3200,20 @@ if is_project_member:
             f"当前共 {len(integrated_data):,} 条记录；页面仅展示前 "
             f"{min(display_limit, len(integrated_data)):,} 条，下载文件仍包含全部记录。"
         )
+        integrated_narrow_display = narrow_table_view(integrated_data.head(display_limit))
         st.dataframe(
-            integrated_data.head(display_limit),
+            dataframe_for_display(integrated_narrow_display.head(display_limit)),
             width="stretch",
             hide_index=True,
         )
         st.download_button(
             "下载行业集成数据",
-            dataframe_to_xlsx(integrated_data, "标准数据"),
+            # Generate the complete workbook only on download, not on every
+            # preview/rerun. Capture this dataset, not mutable session state.
+            lambda frame=integrated_data.copy(): standard_workbook_bytes(frame),
             "偿付能力行业集成数据.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            on_click="ignore",
         )
 
 raw_analysis_source = (

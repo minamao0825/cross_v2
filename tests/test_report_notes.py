@@ -16,6 +16,15 @@ from services.solvency_report_notes import (
 
 
 class ReportNotesTests(unittest.TestCase):
+    def test_pending_capital_notes_migrate_to_new_detail_charts(self):
+        old = pd.DataFrame([
+            {"对应图表名称": "核心资本明细占比-待定", "注释内容": "原核心资本注释"},
+            {"对应图表名称": "附属资本明细占比-待定", "注释内容": "原附属资本注释"},
+        ])
+        lookup = notes_lookup(overlay_notes(company_notes_template(), old))
+        self.assertEqual(lookup["核心一级资本明细"]["注释内容"], "原核心资本注释")
+        self.assertEqual(lookup["附属一级资本明细"]["注释内容"], "原附属资本注释")
+
     def test_company_and_industry_templates_follow_navigation(self):
         company = company_notes_template()
         industry = industry_notes_template()

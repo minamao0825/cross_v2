@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pandas as pd
+from .solvency_filing_catalog import extend_filing_taxonomy
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,7 @@ class MetricDefinition:
             "标准单位": self.unit,
             "数据类型": self.data_type,
             "核心指标": "否",
-            "允许期间口径": "本季度末数|上季度末数|期末数|期初数",
+            "允许期间口径": "本季度末数|上季度末数|下季度末预测数|期末数|期初数",
             "说明": self.formula,
             "STEP5宽表映射": self.step5_wide_mapping,
         }
@@ -167,14 +168,17 @@ SUPPLEMENTAL_BASE_METRICS = (
         "实际资本", "附属二级资本明细", "万元", "金额", "披露",
         ("4.3 减：超限额应扣除的部分",), step5_wide_mapping="否",
     ),
-    MetricDefinition("REGISTERED_CAPITAL", "注册资本", "经营指标", "资本结构", "万元", "金额", "披露"),
+    MetricDefinition(
+        "REGISTERED_CAPITAL", "注册资本", "经营指标", "资本结构", "万元", "金额", "披露",
+        ("注册资本金", "公司注册资本", "注册资本（万元）", "注册资本（亿元）"),
+    ),
 )
 
 
 DERIVED_METRICS = (
     MetricDefinition(
         "POLICY_SURPLUS_CORE_TO_ACTUAL_CAPITAL", "保单未来盈余/核心资本", "派生指标", "保单未来盈余", "倍", "比率", "计算",
-        formula="(计入核心一级资本的保单未来盈余+计入核心二级资本的保单未来盈余)/实际资本",
+        formula="已披露的核心一级及核心二级保单未来盈余之和/实际资本；未披露层级不计入",
         dependencies=("POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2", "ACTUAL_CAPITAL"),
     ),
     MetricDefinition(
@@ -194,14 +198,14 @@ DERIVED_METRICS = (
     MetricDefinition("ANC_T2_TO_ACTUAL_CAPITAL", "附属二级资本占比", "实际资本", "附属资本占比分布", "倍", "比率", "计算", formula="附属二级资本/实际资本", dependencies=("ANC_T2_CAPITAL", "ACTUAL_CAPITAL")),
     MetricDefinition(
         "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL", "计入核心资本的保单未来盈余/核心资本的比例", "实际资本", "保单未来盈余", "倍", "比率", "计算",
-        formula="(计入核心一级资本的保单未来盈余+计入核心二级资本的保单未来盈余)/(核心一级资本+核心二级资本)",
+        formula="(已披露的核心一级保单未来盈余+已披露的核心二级保单未来盈余)/(核心一级资本+核心二级资本)；核心二级未披露时仅以核心一级保单未来盈余为分子",
         dependencies=("POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2", "CORE_T1_CAPITAL", "CORE_T2_CAPITAL"),
     ),
     MetricDefinition("MINIMUM_CAPITAL_TO_RECOGNIZED_LIABILITIES", "最低资本/认可负债", "派生指标", "资本效率", "倍", "比率", "计算", formula="最低资本/认可负债", dependencies=("MINIMUM_CAPITAL", "RECOGNIZED_LIABILITIES")),
     MetricDefinition(
         "POLICY_SURPLUS_TO_INSURANCE_LIABILITIES", "保单未来盈余/保险合同负债", "派生指标", "保单未来盈余", "倍", "比率", "计算",
-        formula="四类保单未来盈余之和/(保险合同负债+独立账户负债)",
-        dependencies=("POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2", "POLICY_SURPLUS_ANC_T1", "POLICY_SURPLUS_ANC_T2", "INSURANCE_CONTRACT_LIABILITY", "SEPARATE_ACCOUNT_LIABILITY"),
+        formula="已披露的各级资本保单未来盈余之和/保险合同负债；未披露层级不计入",
+        dependencies=("POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2", "POLICY_SURPLUS_ANC_T1", "POLICY_SURPLUS_ANC_T2", "INSURANCE_CONTRACT_LIABILITY"),
     ),
     MetricDefinition("RECOGNIZED_ASSETS_TO_ACTUAL_CAPITAL", "认可资产/实际资本", "派生指标", "资本效率", "倍", "比率", "计算", formula="认可资产/实际资本", dependencies=("RECOGNIZED_ASSETS", "ACTUAL_CAPITAL")),
     MetricDefinition("RECOGNIZED_ASSETS_TO_MINIMUM_CAPITAL", "认可资产/最低资本", "派生指标", "资本效率", "倍", "比率", "计算", formula="认可资产/最低资本", dependencies=("RECOGNIZED_ASSETS", "MINIMUM_CAPITAL")),
@@ -288,9 +292,89 @@ CUSTOM_METRICS_BY_CODE = {item.code: item for item in ALL_CUSTOM_METRICS}
 CUSTOM_METRICS_BY_NAME = {item.name: item for item in ALL_CUSTOM_METRICS}
 
 
+METRIC_ALIAS_EXTENSIONS: dict[str, tuple[str, ...]] = {
+    "QUANT_RISK_CAPITAL": (
+        "可资本化风险最低资本",
+        "量化风险最低资本（考虑特征系数后）",
+    ),
+    "ADDITIONAL_CAPITAL": ("附加资本合计",),
+    "MINIMUM_CAPITAL": ("最低资本合计", "最低资本总额"),
+    "ANC_T1_DEFERRED_TAX_ASSET": (
+        "21 递延所得税资产（由经营性亏损引起的递延所得税资产除外）",
+        "递延所得税资产（由经营性亏损引起的递延所得税资产除外）-附属一级资本",
+    ),
+}
+
+
+# These capital components are present as explicit columns in CROSS wide
+# workbooks. Keep the remaining STEP3-only filing rows out of STEP5 mapping.
+STEP5_CROSS_CAPITAL_DETAIL_CODES = {
+    "NON_RECOGNIZED_ASSET_BOOK_VALUE",
+    "LONG_TERM_EQUITY_VALUATION_DIFFERENCE",
+    "CORE_T1_INVESTMENT_PROPERTY_FAIR_VALUE_ADJUSTMENT",
+    "DEFERRED_TAX_ASSET_ADJUSTMENT",
+    "QUALIFYING_CORE_T1_LIABILITY_CAPITAL",
+    "OTHER_CORE_T1_ADJUSTMENT",
+    "ANC_T1_SUBORDINATED_TERM_DEBT",
+    "ANC_T1_CAPITAL_SUPPLEMENTARY_BONDS",
+    "ANC_T1_CONVERTIBLE_SUBORDINATED_DEBT",
+    "ANC_T1_DEFERRED_TAX_ASSET",
+    "ANC_T1_INVESTMENT_PROPERTY_FAIR_VALUE",
+    "OTHER_ANC_T1_CAPITAL",
+}
+
+
+METRIC_PERIOD_EXTENSIONS: dict[str, tuple[str, ...]] = {
+    "INVESTMENT_RETURN": ("本季度数", "近三年平均"),
+    "COMPREHENSIVE_INVESTMENT_RETURN": ("本季度数", "近三年平均"),
+    "NET_ASSETS": (
+        "本季度末数",
+        "上季度末数",
+        "下季度末预测数",
+        "期末数",
+        "期初数",
+    ),
+}
+
+
+def _merge_pipe_values(current: object, additions: tuple[str, ...]) -> str:
+    values = [
+        item.strip()
+        for item in str(current or "").split("|")
+        if item.strip()
+    ]
+    values.extend(item for item in additions if item and item not in values)
+    return "|".join(values)
+
+
 def extend_taxonomy(taxonomy: pd.DataFrame) -> pd.DataFrame:
-    """Add source metrics needed by the CROSS data set without modifying the Excel dictionary."""
-    additions = pd.DataFrame([item.taxonomy_row() for item in SUPPLEMENTAL_BASE_METRICS])
+    """Return the complete system taxonomy used by STEP3 and STEP4."""
+    additions = pd.DataFrame([
+        item.taxonomy_row()
+        for item in (*SUPPLEMENTAL_BASE_METRICS, *DERIVED_METRICS)
+    ])
     existing_codes = set(taxonomy.get("指标编码", pd.Series(dtype=str)).astype(str))
     additions = additions[~additions["指标编码"].isin(existing_codes)]
-    return pd.concat([taxonomy, additions], ignore_index=True).fillna("")
+    result = pd.concat([taxonomy, additions], ignore_index=True).fillna("")
+    for code, aliases in METRIC_ALIAS_EXTENSIONS.items():
+        mask = result["指标编码"].astype(str).eq(code)
+        if mask.any():
+            result.loc[mask, "别名"] = result.loc[mask, "别名"].map(
+                lambda value: _merge_pipe_values(value, aliases)
+            )
+    for code, periods in METRIC_PERIOD_EXTENSIONS.items():
+        mask = result["指标编码"].astype(str).eq(code)
+        if mask.any():
+            result.loc[mask, "允许期间口径"] = result.loc[mask, "允许期间口径"].map(
+                lambda value: _merge_pipe_values(value, periods)
+            )
+    detail_mask = result["指标编码"].astype(str).isin(STEP5_CROSS_CAPITAL_DETAIL_CODES)
+    result.loc[detail_mask, "STEP5宽表映射"] = "是"
+    actual_capital_mask = result["一级模块"].astype(str).eq("实际资本")
+    if actual_capital_mask.any():
+        result.loc[actual_capital_mask, "允许期间口径"] = result.loc[
+            actual_capital_mask, "允许期间口径"
+        ].map(
+            lambda value: _merge_pipe_values(value, ("本季度末数", "上季度末数"))
+        )
+    return extend_filing_taxonomy(result)

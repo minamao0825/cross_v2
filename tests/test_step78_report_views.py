@@ -13,10 +13,10 @@ from step7_solvency import (
     BUBBLE_DISTINCT_COLORS,
     BUBBLE_FULL_PANEL_WIDTH,
     BUBBLE_ZOOM_PANEL_WIDTH,
+    COMPONENT_STACK_DENOMINATOR_CODES,
     COMPONENT_STACK_SPECS,
     DEFAULT_SORT_LABEL,
     QUANT_RISK_STACK_RATIO_CODES,
-    RISK_SCATTER_DUAL_VIEW_CHARTS,
     RISK_SCATTER_DISPLAY_WIDTH,
     RISK_SCATTER_FULL_PANEL_WIDTH,
     RISK_SCATTER_ZOOM_PANEL_WIDTH,
@@ -30,12 +30,16 @@ from step7_solvency import (
     _company_scope_for_types,
     _convert_unit,
     _metric_sort_options,
+    _missing_disclosure_note_lines,
     _render_capital_efficiency_bubble_fragment,
     _render_combination_analysis,
     _render_risk_ratio_scatter_fragment,
     _render_report_metric,
+    _policy_surplus_coverage_note,
+    _core_policy_surplus_coverage_note,
     _report_style,
     _sort_companies_by_metric,
+    _unavailable_metric_details,
 )
 from step8_solvency import (
     SUPPLEMENTAL_SECTIONS,
@@ -77,7 +81,6 @@ from services.solvency_step7_chart_plans import (
     COMPONENT_STACK,
     EFFECT_DIVERGING,
     MARKET_CREDIT_MATRIX,
-    RISK_RATIO_SCATTER,
     SINGLE_METRIC_TREND,
     SOLVENCY_MATRIX,
     SOLVENCY_RATIO_COMBO,
@@ -130,7 +133,7 @@ class Step78ReportViewTests(unittest.TestCase):
         self.assertNotIn('st.markdown(f"#### {metric_name}")', source)
         self.assertIn("_chart_without_internal_title(chart)", source)
 
-    def test_step7_print_keeps_company_cards_intact_without_screen_layout_changes(self):
+    def test_step7_print_keeps_company_cards_intact_and_screen_keeps_single_row(self):
         source = (Path(__file__).resolve().parents[1] / "step7_solvency.py").read_text(
             encoding="utf-8"
         )
@@ -178,7 +181,9 @@ class Step78ReportViewTests(unittest.TestCase):
         self.assertIn('font-size:30px!important', print_css)
         self.assertIn('margin:10px 0 8px!important', print_css)
         screen_css = source[source.index("<style>"):source.index("@media print {")]
-        self.assertNotIn('st-key-annual_company_grid_', screen_css)
+        self.assertIn('st-key-annual_company_grid_', screen_css)
+        self.assertIn('flex-wrap:nowrap!important', screen_css)
+        self.assertIn('flex:1 1 0!important', screen_css)
         self.assertNotIn('table-layout:fixed!important', screen_css)
 
     def test_step7_ai_completion_url_accepts_root_or_full_endpoint(self):
@@ -457,10 +462,10 @@ show_step_7_solvency(frame)
             chart_plan_for("资本使用效率与核心资本占比气泡图").kind,
             CAPITAL_EFFICIENCY_BUBBLE,
         )
-        self.assertEqual(chart_plan_for("核心资本/注册资本").kind, TREND_WITH_COMPANY_BARS)
+        self.assertEqual(chart_plan_for("核心资本/注册资本").kind, SINGLE_METRIC_TREND)
         self.assertEqual(
             chart_plan_for("计入核心资本的保单未来盈余/核心资本的比例").kind,
-            TREND_WITH_COMPANY_BARS,
+            SINGLE_METRIC_TREND,
         )
         self.assertEqual(chart_plan_for("资本规模与结构").kind, CAPITAL_AMOUNT_COMBO)
         self.assertEqual(chart_plan_for("量化风险最低资本构成").kind, COMPONENT_STACK)
@@ -470,26 +475,6 @@ show_step_7_solvency(frame)
         self.assertIn("图表说明：柱状图为综合偿付能力充足率", source)
         self.assertIn("粉色折线为核心偿付能力充足率", source)
         self.assertIn("核心偿付能力充足率（%）", source)
-        self.assertEqual(
-            chart_plan_for("利率与权益价格风险占认可资产率气泡图").kind,
-            RISK_RATIO_SCATTER,
-        )
-        self.assertEqual(
-            chart_plan_for("利差与对手违约风险占认可资产率气泡图").kind,
-            RISK_RATIO_SCATTER,
-        )
-        self.assertEqual(
-            chart_plan_for("寿险与非寿险保险风险占认可负债率气泡图").kind,
-            RISK_RATIO_SCATTER,
-        )
-        self.assertEqual(
-            RISK_SCATTER_DUAL_VIEW_CHARTS,
-            {
-                "利率与权益价格风险占认可资产率气泡图",
-                "利差与对手违约风险占认可资产率气泡图",
-                "寿险与非寿险保险风险占认可负债率气泡图",
-            },
-        )
         self.assertEqual(RISK_SCATTER_DISPLAY_WIDTH, 750)
         self.assertEqual(RISK_SCATTER_FULL_PANEL_WIDTH, BUBBLE_FULL_PANEL_WIDTH)
         self.assertEqual(RISK_SCATTER_ZOOM_PANEL_WIDTH, BUBBLE_ZOOM_PANEL_WIDTH)
@@ -559,7 +544,7 @@ show_step_7_solvency(frame)
         )
         self.assertEqual(
             bubble_layer["encoding"]["x"]["title"],
-            "实际资本/认可资产（%）",
+            "实际资本/注册资本（%）",
         )
         self.assertEqual(
             bubble_layer["encoding"]["y"]["title"],
@@ -576,7 +561,7 @@ show_step_7_solvency(frame)
         self.assertEqual(bubble_layer["encoding"]["x"]["axis"]["domainColor"], "#D9DEE7")
         self.assertEqual(
             bubble_layer["encoding"]["x"]["axis"]["title"],
-            "实际资本/认可资产（%）",
+            "实际资本/注册资本（%）",
         )
         self.assertTrue(spec["config"]["axisX"]["labels"])
         self.assertNotIn("format", bubble_layer["encoding"]["y"]["axis"])
@@ -618,7 +603,7 @@ show_step_7_solvency(frame)
         plotted = {row["公司"]: row for row in spec["datasets"][dataset_name]}
         self.assertEqual(set(plotted), {"甲", "乙"})
         self.assertTrue(all(row["报告期"] == "2025Q4" for row in plotted.values()))
-        self.assertAlmostEqual(plotted["甲"]["实际资本/认可资产"], 0.20)
+        self.assertAlmostEqual(plotted["甲"]["实际资本/注册资本"], 20.0 / 28.0)
         self.assertAlmostEqual(plotted["甲"]["核心资本/注册资本"], 0.50)
         self.assertAlmostEqual(plotted["甲"]["气泡大小"], 100.0)
         self.assertTrue(all("标签位置" not in row for row in plotted.values()))
@@ -626,20 +611,20 @@ show_step_7_solvency(frame)
     def test_capital_efficiency_overlap_zoom_selects_closest_pair(self):
         rows = []
         companies = {
-            "建信人寿": (10.1, 100.0, 10.1 * 0.52),
-            "农银人寿": (10.3, 100.0, 10.3 * 0.51),
-            "中银三星": (10.4, 100.0, 10.4 * 0.69),
-            "招商信诺": (12.8, 100.0, 12.8 * 0.64),
-            "交银人寿": (12.4, 100.0, 12.4 * 0.78),
-            "中邮人寿": (9.1, 100.0, 9.1 * 0.60),
-            "工银安盛": (16.0, 100.0, 16.0 * 0.71),
+            "建信人寿": (10.1, 100.0, 0.52),
+            "农银人寿": (10.3, 100.0, 0.51),
+            "中银三星": (10.4, 100.0, 0.69),
+            "招商信诺": (12.8, 100.0, 0.64),
+            "交银人寿": (12.4, 100.0, 0.78),
+            "中邮人寿": (9.1, 100.0, 0.60),
+            "工银安盛": (16.0, 100.0, 0.71),
         }
-        for company, (actual, assets, core) in companies.items():
+        for company, (actual, assets, core_share) in companies.items():
             values = {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": assets,
-                "REGISTERED_CAPITAL": actual,
-                "CORE_T1_CAPITAL": core,
+                "REGISTERED_CAPITAL": 100.0,
+                "CORE_T1_CAPITAL": core_share * 100.0,
                 "CORE_T2_CAPITAL": 0.0,
             }
             for code, value in values.items():
@@ -679,12 +664,12 @@ show_step_7_solvency(frame)
         visible_companies = {
             row["公司"]
             for row in spec["datasets"][dataset_name]
-            if x_domain[0] <= row["实际资本/认可资产"] <= x_domain[1]
+            if x_domain[0] <= row["实际资本/注册资本"] <= x_domain[1]
             and y_domain[0] <= row["核心资本/注册资本"] <= y_domain[1]
         }
         self.assertEqual(visible_companies, {"建信人寿", "农银人寿", "中邮人寿"})
         selected_x = [companies[name][0] / 100 for name in visible_companies]
-        selected_y = [companies[name][2] / companies[name][0] for name in visible_companies]
+        selected_y = [companies[name][2] for name in visible_companies]
         self.assertAlmostEqual(
             x_domain[1] - x_domain[0],
             (max(selected_x) - min(selected_x)) * 1.35,
@@ -727,8 +712,8 @@ show_step_7_solvency(frame)
             values = {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": 100.0,
-                "REGISTERED_CAPITAL": actual,
-                "CORE_T1_CAPITAL": actual * core_share,
+                "REGISTERED_CAPITAL": 100.0,
+                "CORE_T1_CAPITAL": 100.0 * core_share,
                 "CORE_T2_CAPITAL": 0.0,
             }
             for code, value in values.items():
@@ -762,7 +747,7 @@ show_step_7_solvency(frame)
         visible_companies = {
             row["公司"]
             for row in spec["datasets"][dataset_name]
-            if x_domain[0] <= row["实际资本/认可资产"] <= x_domain[1]
+            if x_domain[0] <= row["实际资本/注册资本"] <= x_domain[1]
             and y_domain[0] <= row["核心资本/注册资本"] <= y_domain[1]
         }
         self.assertEqual(visible_companies, {"密集甲", "密集乙", "密集丙"})
@@ -778,8 +763,8 @@ show_step_7_solvency(frame)
             for code, value in {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": 100.0,
-                "REGISTERED_CAPITAL": actual,
-                "CORE_T1_CAPITAL": actual * core_share,
+                "REGISTERED_CAPITAL": 100.0,
+                "CORE_T1_CAPITAL": 100.0 * core_share,
                 "CORE_T2_CAPITAL": 0.0,
             }.items():
                 rows.append({
@@ -823,8 +808,8 @@ show_step_7_solvency(frame)
             for code, value in {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": 100.0,
-                "REGISTERED_CAPITAL": actual,
-                "CORE_T1_CAPITAL": actual * core_share,
+                "REGISTERED_CAPITAL": 100.0,
+                "CORE_T1_CAPITAL": 100.0 * core_share,
                 "CORE_T2_CAPITAL": 0.0,
             }.items():
                 rows.append({
@@ -890,8 +875,8 @@ show_step_7_solvency(frame)
             for code, value in {
                 "ACTUAL_CAPITAL": actual,
                 "RECOGNIZED_ASSETS": 100.0,
-                "REGISTERED_CAPITAL": actual,
-                "CORE_T1_CAPITAL": actual * core_share,
+                "REGISTERED_CAPITAL": 100.0,
+                "CORE_T1_CAPITAL": 100.0 * core_share,
                 "CORE_T2_CAPITAL": 0.0,
             }.items():
                 rows.append({
@@ -1031,7 +1016,7 @@ show_step_7_solvency(frame)
         ])
         shared_domain = metric_bar_axis_domain(frame, code, periods)
         self.assertAlmostEqual(shared_domain[0], 0.0)
-        self.assertAlmostEqual(shared_domain[1], 0.65 * 1.12)
+        self.assertAlmostEqual(shared_domain[1], 65.0 * 1.12)
 
         for company in ("甲", "乙"):
             spec = build_company_period_bar_chart(
@@ -1057,6 +1042,9 @@ show_step_7_solvency(frame)
                 spec["layer"][0]["encoding"]["color"]["scale"]["range"],
                 ["#ACEAFF", "#00B8F5", "#B497FF"],
             )
+            dataset = spec["datasets"][spec["data"]["name"]]
+            self.assertTrue(all(row["单位"] == "%" for row in dataset))
+            self.assertTrue(all(row["数值标签"].endswith("%") for row in dataset))
 
     def test_policy_surplus_core_ratio_company_bars_share_axis_and_period_colors(self):
         code = "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL"
@@ -1077,7 +1065,8 @@ show_step_7_solvency(frame)
             for period, value in zip(periods, values)
         ])
         shared_domain = metric_bar_axis_domain(frame, code, periods)
-        self.assertEqual(shared_domain, (0.0, 0.55 * 1.12))
+        self.assertAlmostEqual(shared_domain[0], 0.0)
+        self.assertAlmostEqual(shared_domain[1], 55.0 * 1.12)
 
         for company in ("甲", "乙"):
             spec = build_company_period_bar_chart(
@@ -1106,6 +1095,9 @@ show_step_7_solvency(frame)
                 spec["layer"][0]["encoding"]["color"]["scale"]["range"],
                 ["#ACEAFF", "#00B8F5", "#B497FF"],
             )
+            dataset = spec["datasets"][spec["data"]["name"]]
+            self.assertTrue(all(row["单位"] == "%" for row in dataset))
+            self.assertTrue(all(row["数值标签"].endswith("%") for row in dataset))
 
     def test_solvency_ratio_combo_uses_one_axis_and_integer_labels(self):
         rows = []
@@ -1172,13 +1164,54 @@ show_step_7_solvency(frame)
                 [0.0, 250.0],
             )
             self.assertEqual(
-                spec["layer"][1]["encoding"]["text"]["format"],
-                ",.0f",
+                spec["layer"][1]["encoding"]["text"]["field"],
+                "数值标签",
             )
             self.assertEqual(
-                spec["layer"][4]["encoding"]["text"]["format"],
-                ",.0f",
+                spec["layer"][4]["encoding"]["text"]["field"],
+                "数值标签",
             )
+
+    def test_step7_combo_lines_convert_multiple_units_to_percent(self):
+        rows = []
+        for code, value, unit in (
+            ("CORE_SOLVENCY_RATIO", 0.8, "倍"),
+            ("COMBINED_SOLVENCY_RATIO", 1.2, "倍"),
+            ("ACTUAL_CAPITAL", 120.0, "亿元"),
+            ("MINIMUM_CAPITAL", 70.0, "亿元"),
+        ):
+            rows.append({
+                "公司": "甲",
+                "报告期": "2025Q4",
+                "指标编码": code,
+                "指标名称": code,
+                "数值": value,
+                "单位": unit,
+            })
+        frame = pd.DataFrame(rows)
+
+        solvency_spec = build_solvency_ratio_combo_chart(
+            frame,
+            ["2025Q4"],
+        ).to_dict(validate=True)
+        core_data_name = solvency_spec["layer"][2]["data"]["name"]
+        core_row = solvency_spec["datasets"][core_data_name][0]
+        self.assertEqual(core_row["数值"], 80.0)
+        self.assertEqual(core_row["单位"], "%")
+        self.assertEqual(core_row["数值标签"], "80%")
+
+        capital_spec = build_capital_ratio_combo_chart(
+            frame,
+            {"实际资本": ("ACTUAL_CAPITAL",), "最低资本": ("MINIMUM_CAPITAL",)},
+            ["2025Q4"],
+            "综合充足率变化",
+            ratio_code="COMBINED_SOLVENCY_RATIO",
+            ratio_label="综合偿付能力充足率（%）",
+        ).to_dict(validate=True)
+        line_data_name = capital_spec["vconcat"][0]["data"]["name"]
+        line_row = capital_spec["datasets"][line_data_name][0]
+        self.assertEqual(line_row["线值"], 120.0)
+        self.assertEqual(line_row["线标签"], "120.0%")
 
     def test_step7_new_chart_builders_produce_valid_specs(self):
         rows = []
@@ -1579,13 +1612,187 @@ show_step_7_solvency(frame)
         )
         spec = chart.to_dict(validate=True)
         dataset = spec["datasets"][spec["data"]["name"]]
-        flags = {float(row["数值"]): row for row in dataset if row.get("数值") is not None}
-        self.assertFalse(flags[0.39]["显示标签"])
-        self.assertFalse(flags[0.40]["显示标签"])
-        self.assertTrue(flags[0.41]["显示标签"])
-        self.assertTrue(flags[0.55]["显示标签"])
+        flags = {round(float(row["数值"]), 6): row for row in dataset if row.get("数值") is not None}
+        self.assertFalse(flags[39.0]["显示标签"])
+        self.assertFalse(flags[40.0]["显示标签"])
+        self.assertTrue(flags[41.0]["显示标签"])
+        self.assertTrue(flags[55.0]["显示标签"])
+        self.assertEqual(flags[41.0]["数值标签"], "41.00%")
+        self.assertTrue(all(row["单位"] == "%" for row in flags.values()))
         self.assertTrue(all(not row["是否全局最大"] for row in flags.values()))
         self.assertTrue(all(not row["是否全局最小"] for row in flags.values()))
+
+    def test_policy_surplus_unavailable_details_include_company_period_and_reason(self):
+        frame = pd.DataFrame([
+            {
+                "公司": "甲人寿",
+                "报告期": "2026Q1",
+                "指标编码": "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",
+                "指标名称": "计入核心资本的保单未来盈余/核心资本的比例",
+                "数值": None,
+                "披露状态": "无法计算",
+                "备注": "无法计算：计入核心二级资本的保单未来盈余未披露",
+            },
+            {
+                "公司": "乙人寿",
+                "报告期": "2026Q1",
+                "指标编码": "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",
+                "指标名称": "计入核心资本的保单未来盈余/核心资本的比例",
+                "数值": 0.2,
+                "披露状态": "已计算",
+                "备注": "",
+            },
+        ])
+
+        self.assertEqual(
+            _unavailable_metric_details(
+                frame,
+                "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",
+                ["2026Q1"],
+            ),
+            [("甲人寿", "2026Q1", "计入核心二级资本的保单未来盈余未披露")],
+        )
+
+    def test_business_combo_missing_notes_group_companies_periods_and_metrics(self):
+        companies = ["工银安盛", "建信人寿", "交银人寿", "农银人寿", "招商信诺", "中银三星", "中邮人寿"]
+        details = [
+            "2025Q1·本季度末数：签单保费",
+            "2025Q1·本季度末数：新业务利润率",
+            "2025Q3·本季度末数：签单保费",
+            "2025Q3·本季度末数：新业务利润率",
+        ]
+        notes = _missing_disclosure_note_lines(
+            "签单保费与新业务利润率",
+            companies,
+            {company: details for company in companies},
+        )
+        self.assertEqual(notes, [
+            "注：未披露——工银安盛、建信人寿、交银人寿、农银人寿、招商信诺、中银三星、中邮人寿："
+            "2025Q1、2025Q3均未披露签单保费及新业务利润率。"
+        ])
+
+        value_notes = _missing_disclosure_note_lines(
+            "新业务价值与新业务价值率",
+            companies[:2],
+            {company: [
+                "2025Q1·本季度末数：新业务价值",
+                "2025Q1·本季度末数：签单保费（无法计算新业务价值率）",
+            ] for company in companies[:2]},
+        )
+        self.assertEqual(value_notes, [
+            "注：未披露——工银安盛、建信人寿：2025Q1均未披露新业务价值及签单保费（新业务价值率因此无法计算）。"
+        ])
+
+    def test_quality_chart_missing_notes_are_compact(self):
+        companies = ["甲公司", "乙公司", "丙公司"]
+        surrender = _missing_disclosure_note_lines(
+            "综合退保率",
+            companies,
+            {company: ["2025Q1", "2025Q3"] for company in companies},
+        )
+        self.assertEqual(surrender, [
+            "注：未披露——甲公司、乙公司、丙公司：2025Q1、2025Q3均未披露综合退保率。"
+        ])
+
+        radar_metrics = [
+            "净资产收益率", "总资产收益率", "投资收益率（当季数）",
+            "综合投资收益率（当季数）", "近三年平均投资收益率", "近三年平均综合投资收益率",
+        ]
+        radar = _missing_disclosure_note_lines(
+            "投资质量六指标雷达图",
+            companies,
+            {company: radar_metrics for company in companies},
+        )
+        self.assertEqual(radar, [
+            "注：未披露——甲公司、乙公司、丙公司：六项投资质量指标均未披露。"
+        ])
+
+        cumulative_details = [
+            "2025Q1·累计：投资收益率",
+            "2025Q1·累计：综合投资收益率",
+            "2025Q3·累计：投资收益率",
+            "2025Q3·累计：综合投资收益率",
+        ]
+        cumulative = _missing_disclosure_note_lines(
+            "累计投资收益率与累计综合投资收益率",
+            companies,
+            {company: cumulative_details for company in companies},
+        )
+        self.assertEqual(cumulative, [
+            "注：未披露——甲公司、乙公司、丙公司：2025Q1、2025Q3均未披露投资收益率及综合投资收益率。"
+        ])
+
+        three_year = _missing_disclosure_note_lines(
+            "近三年平均投资收益率与综合投资收益率",
+            companies,
+            {
+                "甲公司": ["2024Q4·近三年平均：投资收益率"],
+                "乙公司": ["2025Q2·近三年平均：综合投资收益率"],
+            },
+        )
+        self.assertEqual(three_year, [
+            "注：未披露——甲公司、乙公司部分报告期的近三年平均投资收益率或综合投资收益率未披露。"
+        ])
+
+    def test_policy_surplus_ratio_note_explains_core_only_and_four_levels(self):
+        codes = (
+            "POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2",
+            "POLICY_SURPLUS_ANC_T1", "POLICY_SURPLUS_ANC_T2",
+        )
+        core_only = ("中邮人寿", "中银三星", "建信人寿", "招商信诺")
+        all_four = ("农银人寿", "交银人寿", "工银安盛")
+        rows, ratios = [], []
+        for company in (*core_only, *all_four):
+            ratios.append({"公司": company, "报告期": "2025Q4", "数值": 0.1})
+            for code, value in zip(codes, (10, 0, 0, 0) if company in core_only else (10, 0, 5, 2)):
+                rows.append({
+                    "公司": company, "报告期": "2025Q4", "期间口径": "本季度末数",
+                    "指标编码": code, "数值": value, "披露状态": "已披露",
+                    "来源类型": "外部数据集",
+                })
+        note = _policy_surplus_coverage_note(pd.DataFrame(rows), pd.DataFrame(ratios))
+        self.assertIn("中邮人寿、中银三星、建信人寿、招商信诺：分子仅计入核心一级资本", note)
+        self.assertIn("农银人寿、交银人寿、工银安盛：分子计入四类", note)
+
+        # A source PDF's explicit zero is a disclosed level, unlike the wide table's zero placeholder.
+        for row in rows:
+            if row["公司"] == "中邮人寿" and row["指标编码"] != codes[0]:
+                row["披露状态"] = "已披露为0"
+        note = _policy_surplus_coverage_note(pd.DataFrame(rows), pd.DataFrame(ratios))
+        self.assertNotIn("中邮人寿：分子仅计入核心一级资本", note)
+
+    def test_core_policy_surplus_ratio_note_explains_core_t1_only_and_both_levels(self):
+        codes = (
+            "POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2",
+            "POLICY_SURPLUS_ANC_T1", "POLICY_SURPLUS_ANC_T2",
+        )
+        core_t1_only = ("中邮人寿", "中银三星", "建信人寿", "招商信诺")
+        both_core_levels = ("农银人寿", "交银人寿", "工银安盛")
+        rows, ratios = [], []
+        for company in (*core_t1_only, *both_core_levels):
+            ratios.append({"公司": company, "报告期": "2025Q4", "数值": 0.1})
+            values = (10, 0, 0, 0) if company in core_t1_only else (10, 0, 5, 2)
+            for code, value in zip(codes, values):
+                rows.append({
+                    "公司": company, "报告期": "2025Q4", "期间口径": "本季度末数",
+                    "指标编码": code, "数值": value, "披露状态": "已披露",
+                    "来源类型": "外部数据集",
+                })
+        note = _core_policy_surplus_coverage_note(pd.DataFrame(rows), pd.DataFrame(ratios))
+        self.assertIn(
+            "中邮人寿、中银三星、建信人寿、招商信诺：分子仅计入核心一级资本的保单未来盈余，核心二级资本没有披露这个明细",
+            note,
+        )
+        self.assertIn(
+            "农银人寿、交银人寿、工银安盛：分子计入核心一级及核心二级资本的保单未来盈余",
+            note,
+        )
+
+        for row in rows:
+            if row["公司"] == "中邮人寿" and row["指标编码"] == "POLICY_SURPLUS_CORE_T2":
+                row["披露状态"] = "已披露为0"
+        note = _core_policy_surplus_coverage_note(pd.DataFrame(rows), pd.DataFrame(ratios))
+        self.assertNotIn("中邮人寿：分子仅计入核心一级资本", note)
 
     def test_capital_ratio_combo_shares_amount_axis_within_each_chart_group(self):
         rows = []
@@ -1673,6 +1880,77 @@ show_step_7_solvency(frame)
             self.assertEqual(bar_domain, [0.0, 324.0])
             core_company_domains.append(bar_domain)
         self.assertEqual(core_company_domains[0], core_company_domains[1])
+
+        grouped_domain = capital_ratio_amount_axis_domain(
+            frame,
+            combined_groups,
+            periods,
+            stacked=False,
+        )
+        self.assertEqual(grouped_domain, (0.0, 324.0))
+        grouped_spec = build_capital_ratio_combo_chart(
+            frame[frame["公司"].eq("甲")],
+            combined_groups,
+            periods,
+            "综合充足率变化",
+            ratio_code="COMBINED_SOLVENCY_RATIO",
+            shared_amount_domain=grouped_domain,
+            bar_layout="grouped",
+        ).to_dict(validate=True)
+        grouped_bars = grouped_spec["vconcat"][1]["layer"][0]["encoding"]
+        grouped_labels = grouped_spec["vconcat"][1]["layer"][1]["encoding"]
+        self.assertEqual(grouped_bars["xOffset"]["field"], "组成类别")
+        self.assertEqual(grouped_bars["xOffset"]["scale"]["paddingInner"], 0.0)
+        self.assertEqual(grouped_bars["xOffset"]["scale"]["paddingOuter"], 0.04)
+        self.assertEqual(
+            grouped_spec["vconcat"][1]["layer"][0]["mark"]["width"],
+            {"band": 0.94},
+        )
+        self.assertEqual(grouped_bars["y"]["field"], "数值")
+        self.assertNotIn("y2", grouped_bars)
+        self.assertEqual(grouped_labels["xOffset"]["field"], "组成类别")
+        self.assertEqual(grouped_bars["y"]["scale"]["domain"], [0.0, 324.0])
+
+    def test_capital_ratio_views_render_only_stacked_combo(self):
+        rows = []
+        values = {
+            "ACTUAL_CAPITAL": 120.0,
+            "MINIMUM_CAPITAL": 70.0,
+            "CORE_T1_CAPITAL": 65.0,
+            "CORE_T2_CAPITAL": 15.0,
+            "COMBINED_SOLVENCY_RATIO": 171.4,
+            "CORE_SOLVENCY_RATIO": 114.3,
+        }
+        for code, value in values.items():
+            rows.append({
+                "公司": "甲",
+                "报告期": "2025Q4",
+                "指标编码": code,
+                "指标名称": code,
+                "数值": value,
+                "单位": "%" if code.endswith("RATIO") else "亿元",
+            })
+        frame = pd.DataFrame(rows)
+
+        for chart_name in ("综合充足率变化", "核心充足率变化"):
+            with (
+                patch("step7_solvency.st.caption") as caption,
+                patch("step7_solvency.st.markdown") as markdown,
+                patch("step7_solvency._render_chart_legend"),
+                patch("step7_solvency._render_company_chart_grid") as render_grid,
+            ):
+                _render_combination_analysis(
+                    frame,
+                    chart_name,
+                    periods=["2025Q4"],
+                    unit_mode="亿元",
+                    highlight_company="无",
+                    key_prefix="capital_ratio_variants",
+                )
+
+            self.assertEqual(render_grid.call_count, 1)
+            self.assertFalse(any("并列柱组合图" in str(call) for call in markdown.call_args_list))
+            self.assertFalse(any("每个报告期的两项资本各自成柱" in str(call) for call in caption.call_args_list))
 
     def test_step7_excel_guide_bar_combo_and_signed_stack_validate(self):
         rows = []
@@ -1912,8 +2190,11 @@ show_step_7_solvency(frame)
             {"甲": "#00338D"},
             "甲",
         ).to_dict(validate=True)
-        self.assertEqual(trend["layer"][0]["encoding"]["y"]["axis"]["format"], ".1%")
-        self.assertEqual(trend["layer"][3]["encoding"]["text"]["format"], ".1%")
+        self.assertEqual(trend["layer"][0]["encoding"]["y"]["axis"]["format"], ",.1f")
+        self.assertEqual(trend["layer"][3]["encoding"]["text"]["field"], "数值标签")
+        trend_dataset = trend["datasets"][trend["data"]["name"]]
+        self.assertEqual(trend_dataset[0]["数值"], 31.0)
+        self.assertEqual(trend_dataset[0]["数值标签"], "31.0%")
 
     def test_quant_risk_renderer_preserves_denominator_and_ratio_inputs(self):
         chart_name = "量化风险最低资本构成"
@@ -1974,6 +2255,67 @@ show_step_7_solvency(frame)
             dict,
         )
 
+    def test_life_insurance_risk_stack_uses_total_as_denominator_and_negative_diversification(self):
+        chart_name = "各类保险风险（寿）占比"
+        values = {
+            "INSURANCE_RISK_CAPITAL": 100.0,
+            "LOSS_OCCURRENCE_RISK_CAPITAL": 50.0,
+            "SURRENDER_RISK_CAPITAL": 30.0,
+            "EXPENSE_RISK_CAPITAL": 20.0,
+            "LIFE_INSURANCE_RISK_DIVERSIFICATION_EFFECT": 10.0,
+        }
+        frame = pd.DataFrame([
+            {
+                "公司": "测试公司",
+                "报告期": "2025Q4",
+                "指标编码": code,
+                "指标名称": code,
+                "数值": value,
+                "单位": "亿元",
+            }
+            for code, value in values.items()
+        ])
+
+        self.assertEqual(
+            COMPONENT_STACK_DENOMINATOR_CODES[chart_name],
+            "INSURANCE_RISK_CAPITAL",
+        )
+        self.assertIn(
+            "INSURANCE_RISK_CAPITAL",
+            _chart_input_metric_codes(chart_name, COMPONENT_STACK),
+        )
+        with (
+            patch("step7_solvency.st.caption"),
+            patch("step7_solvency._render_chart_legend"),
+            patch("step7_solvency._render_company_chart_grid") as render_grid,
+        ):
+            _render_combination_analysis(
+                frame,
+                chart_name,
+                periods=["2025Q4"],
+                unit_mode="亿元",
+                highlight_company="无",
+                key_prefix="life_risk_stack_regression",
+            )
+
+        filtered_frame = render_grid.call_args.args[0]
+        self.assertIn("INSURANCE_RISK_CAPITAL", set(filtered_frame["指标编码"]))
+        chart_factory = render_grid.call_args.args[1]
+        spec = chart_factory(filtered_frame).to_dict(validate=True)
+        dataset = spec["datasets"][spec["data"]["name"]]
+        rows = {row["指标编码"]: row for row in dataset}
+        self.assertAlmostEqual(rows["LOSS_OCCURRENCE_RISK_CAPITAL"]["构成占比"], 0.50)
+        self.assertAlmostEqual(rows["SURRENDER_RISK_CAPITAL"]["构成占比"], 0.30)
+        self.assertAlmostEqual(rows["EXPENSE_RISK_CAPITAL"]["构成占比"], 0.20)
+        self.assertAlmostEqual(
+            rows["LIFE_INSURANCE_RISK_DIVERSIFICATION_EFFECT"]["构成占比"],
+            -0.10,
+        )
+        self.assertLess(
+            rows["LIFE_INSURANCE_RISK_DIVERSIFICATION_EFFECT"]["堆叠终点"],
+            0,
+        )
+
     def test_quant_risk_stack_excludes_feature_factor_and_control_risk(self):
         quant_specs = COMPONENT_STACK_SPECS["量化风险最低资本构成"]
         codes = {code for code, _, _ in quant_specs}
@@ -1997,6 +2339,7 @@ show_step_7_solvency(frame)
 
     def test_policy_surplus_uses_the_same_blue_purple_capital_hierarchy(self):
         policy_specs = COMPONENT_STACK_SPECS["计入各级资本的保单未来盈余构成占比"]
+        quant_specs = COMPONENT_STACK_SPECS["量化风险最低资本构成"]
         self.assertEqual(
             [color for _, _, color in policy_specs],
             ["#00B8F5", "#ACEAFF", "#B497FF", "#7213EA"],
@@ -2004,8 +2347,28 @@ show_step_7_solvency(frame)
         market_specs = COMPONENT_STACK_SPECS["各类市场风险占比"]
         self.assertEqual(
             [color for _, _, color in market_specs],
-            ["#FFA3DA", "#00B8F5", "#FD349C", "#269924", "#ACEAFF", "#B497FF", "#63EBB2"],
+            ["#FFA3DA", "#00B8F5", "#FD349C", "#F68D2E", "#ACEAFF", "#B497FF", "#63EBB2"],
         )
+        life_specs = COMPONENT_STACK_SPECS["各类保险风险（寿）占比"]
+        life_diversification_color = next(
+            color for code, _, color in life_specs
+            if code == "LIFE_INSURANCE_RISK_DIVERSIFICATION_EFFECT"
+        )
+        quant_diversification_color = next(
+            color for code, _, color in quant_specs
+            if code == "QUANT_RISK_DIVERSIFICATION_EFFECT"
+        )
+        self.assertEqual(life_diversification_color, quant_diversification_color)
+        credit_specs = COMPONENT_STACK_SPECS["各类信用风险占比"]
+        market_diversification_color = next(
+            color for code, _, color in market_specs
+            if code == "MARKET_RISK_DIVERSIFICATION_EFFECT"
+        )
+        credit_diversification_color = next(
+            color for code, _, color in credit_specs
+            if code == "CREDIT_RISK_DIVERSIFICATION_EFFECT"
+        )
+        self.assertEqual(credit_diversification_color, market_diversification_color)
 
     def test_market_risk_stack_uses_market_total_and_includes_overseas_equity(self):
         rows = [
@@ -2055,6 +2418,31 @@ show_step_7_solvency(frame)
         self.assertAlmostEqual(overseas_equity["堆叠终点"], 0.73)
         self.assertLess(diversification["堆叠终点"], 0)
         self.assertAlmostEqual(diversification["堆叠终点"], -0.12)
+
+    def test_life_insurance_risk_stack_hides_labels_at_or_below_ten_percent(self):
+        rows = [
+            {"公司": "甲", "报告期": "2026Q2", "指标编码": "INSURANCE_RISK_CAPITAL", "数值": 100.0, "单位": "亿元"},
+            {"公司": "甲", "报告期": "2026Q2", "指标编码": "LOSS_OCCURRENCE_RISK_CAPITAL", "数值": 79.9, "单位": "亿元"},
+            {"公司": "甲", "报告期": "2026Q2", "指标编码": "SURRENDER_RISK_CAPITAL", "数值": 10.0, "单位": "亿元"},
+            {"公司": "甲", "报告期": "2026Q2", "指标编码": "EXPENSE_RISK_CAPITAL", "数值": 10.1, "单位": "亿元"},
+        ]
+        frame = pd.DataFrame(rows)
+        frame["指标名称"] = frame["指标编码"]
+        chart = build_component_stack_chart(
+            frame,
+            COMPONENT_STACK_SPECS["各类保险风险（寿）占比"],
+            ["2026Q2"],
+            "各类保险风险（寿）占比",
+            label_denominator_code="INSURANCE_RISK_CAPITAL",
+            plot_proportions=True,
+            min_label_share=0.10,
+            hide_labels_at_threshold=True,
+        )
+        spec = chart.to_dict(validate=True)
+        dataset = spec["datasets"][spec["data"]["name"]]
+        labels = {row["指标编码"]: row["占比标签"] for row in dataset}
+        self.assertEqual(labels["SURRENDER_RISK_CAPITAL"], "")
+        self.assertEqual(labels["EXPENSE_RISK_CAPITAL"], "10%")
         self.assertLess(spec["layer"][0]["encoding"]["y"]["scale"]["domain"][1], 2.0)
 
     def test_credit_risk_stack_uses_credit_total_and_negative_diversification(self):
@@ -2227,7 +2615,7 @@ show_step_7_solvency(frame)
         self.assertEqual(panel_spec["spec"]["layer"][1]["mark"]["type"], "line")
         self.assertLessEqual(len(panel_spec["spec"]["layer"]), 5)
 
-    def test_step7_non_life_risk_to_liabilities_uses_five_decimal_labels(self):
+    def test_step7_non_life_risk_to_liabilities_uses_permille_display(self):
         frame = pd.DataFrame([
             {
                 "公司": company,
@@ -2253,14 +2641,24 @@ show_step_7_solvency(frame)
         ).to_dict(validate=True)
         for layer_index in (2, 3, 4):
             self.assertEqual(
-                spec["layer"][layer_index]["encoding"]["text"]["format"],
-                ",.5f",
+                spec["layer"][layer_index]["encoding"]["text"]["field"],
+                "数值标签",
             )
         y_encoding = spec["layer"][0]["encoding"]["y"]
         self.assertEqual(y_encoding["axis"]["format"], ".5f")
         self.assertEqual(y_encoding["axis"]["tickCount"], 6)
         domain = y_encoding["scale"]["domain"]
-        self.assertLess(domain[1] - domain[0], 0.002)
+        self.assertLess(domain[1] - domain[0], 2.0)
+        dataset = spec["datasets"][spec["data"]["name"]]
+        disclosed = [row for row in dataset if row["数值"] is not None]
+        self.assertTrue(all(row["单位"] == "‰" for row in disclosed))
+        self.assertTrue(all(row["数值标签"].endswith("‰") for row in disclosed))
+        first_value = next(
+            row["数值"] for row in disclosed
+            if row["公司"] == "甲" and row["报告期"] == "2025Q2"
+        )
+        self.assertAlmostEqual(first_value, 1.2345)
+        self.assertIn("‰", y_encoding["title"])
 
     def test_step7_capital_layout_avoids_trailing_blank_panels(self):
         def amount_rows(company_count: int) -> pd.DataFrame:

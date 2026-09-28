@@ -11,6 +11,8 @@ OVERVIEW_LEVEL = "行业整体偿付能力概览"
 COMPANY_OVERVIEW_LEVEL = "关键偿付数据概览"
 ACTUAL_CAPITAL_LEVEL = "实际资本数据对比"
 MINIMUM_CAPITAL_LEVEL = "最低资本数据对比"
+RECOGNIZED_ASSETS_LEVEL = "认可资产数据对比"
+OPERATING_QUALITY_LEVEL = "主要经营指标对比"
 APPENDIX_LEVEL = "附录"
 MARKET_RISK_ASSET_SCATTER = "利率与权益价格风险占认可资产率气泡图"
 CREDIT_RISK_ASSET_SCATTER = "利差与对手违约风险占认可资产率气泡图"
@@ -167,7 +169,7 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
         "关键偿付数据概览",
         (
             "CORE_SOLVENCY_RATIO", "COMBINED_SOLVENCY_RATIO", "ACTUAL_CAPITAL",
-            "MINIMUM_CAPITAL", "POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2",
+            "POLICY_SURPLUS_CORE_T1", "POLICY_SURPLUS_CORE_T2",
             "POLICY_SURPLUS_ANC_T1", "POLICY_SURPLUS_ANC_T2",
             "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL", "MARKET_RISK_TO_QUANT_CAPITAL",
             "LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL", "RECOGNIZED_LIABILITIES",
@@ -205,6 +207,18 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
     NavigationEntry(
         COMPANY_OVERVIEW_LEVEL,
         "资本充足率",
+        "计入核心资本的保单未来盈余/核心资本的比例",
+        ("POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",),
+    ),
+    NavigationEntry(
+        COMPANY_OVERVIEW_LEVEL,
+        "保单未来盈余",
+        "计入核心资本的保单未来盈余/核心资本的比例",
+        ("POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",),
+    ),
+    NavigationEntry(
+        COMPANY_OVERVIEW_LEVEL,
+        "资本充足率",
         "资本使用效率与核心资本占比气泡图",
         (
             "ACTUAL_CAPITAL", "RECOGNIZED_ASSETS", "REGISTERED_CAPITAL",
@@ -215,9 +229,19 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
     NavigationEntry(COMPANY_OVERVIEW_LEVEL, "资本使用效率", "核心资本/注册资本", ("CORE_CAPITAL_TO_REGISTERED_CAPITAL",)),
     NavigationEntry(COMPANY_OVERVIEW_LEVEL, "资本使用效率", "实际资本/认可资产率", ("ACTUAL_CAPITAL_TO_RECOGNIZED_ASSETS",)),
     NavigationEntry(ACTUAL_CAPITAL_LEVEL, "行业资本分级", "资本规模与结构", ("CORE_T1_CAPITAL", "CORE_T2_CAPITAL", "ANC_T1_CAPITAL", "ANC_T2_CAPITAL"), True),
-    NavigationEntry(ACTUAL_CAPITAL_LEVEL, "核心资本", "核心资本明细占比-待定", (), always_available=True),
-    NavigationEntry(ACTUAL_CAPITAL_LEVEL, "附属资本", "附属资本明细占比-待定", (), always_available=True),
-    NavigationEntry(ACTUAL_CAPITAL_LEVEL, "保单未来盈余", "计入核心资本的保单未来盈余/核心资本的比例", ("POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",)),
+    NavigationEntry(ACTUAL_CAPITAL_LEVEL, "核心资本", "核心一级资本明细", (
+        "FINANCIAL_STATEMENT_NET_ASSETS", "NON_RECOGNIZED_ASSET_BOOK_VALUE",
+        "LONG_TERM_EQUITY_VALUATION_DIFFERENCE", "CORE_T1_INVESTMENT_PROPERTY_FAIR_VALUE_ADJUSTMENT",
+        "DEFERRED_TAX_ASSET_ADJUSTMENT", "AGRICULTURAL_CATASTROPHE_RISK_RESERVE",
+        "POLICY_SURPLUS_CORE_T1", "QUALIFYING_CORE_T1_LIABILITY_CAPITAL",
+        "OTHER_CORE_T1_ADJUSTMENT", "CORE_T1_CAPITAL",
+    ), always_available=True),
+    NavigationEntry(ACTUAL_CAPITAL_LEVEL, "附属资本", "附属一级资本明细", (
+        "ANC_T1_SUBORDINATED_TERM_DEBT", "ANC_T1_CAPITAL_SUPPLEMENTARY_BONDS",
+        "ANC_T1_CONVERTIBLE_SUBORDINATED_DEBT", "ANC_T1_DEFERRED_TAX_ASSET",
+        "ANC_T1_INVESTMENT_PROPERTY_FAIR_VALUE", "POLICY_SURPLUS_ANC_T1",
+        "OTHER_ANC_T1_CAPITAL", "ANC_T1_CAPITAL",
+    ), always_available=True),
     NavigationEntry(
         ACTUAL_CAPITAL_LEVEL,
         "保单未来盈余",
@@ -247,17 +271,8 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
         ),
         True,
     ),
-    NavigationEntry(
-        MINIMUM_CAPITAL_LEVEL,
-        "保险风险",
-        INSURANCE_RISK_LIABILITY_SCATTER,
-        (
-            "LIFE_INSURANCE_RISK_TO_LIABILITIES",
-            "NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",
-            "RECOGNIZED_LIABILITIES",
-        ),
-        True,
-    ),
+    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "保险风险", "保险风险（寿）/认可负债率", ("LIFE_INSURANCE_RISK_TO_LIABILITIES",)),
+    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "保险风险", "保险风险（非寿）/认可负债率", ("NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",)),
     NavigationEntry(
         MINIMUM_CAPITAL_LEVEL,
         "市场风险",
@@ -270,16 +285,8 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
         ),
         True,
     ),
-    NavigationEntry(
-        MINIMUM_CAPITAL_LEVEL,
-        "市场风险",
-        MARKET_RISK_ASSET_SCATTER,
-        (
-            "INTEREST_RATE_RISK_TO_ASSETS", "EQUITY_RISK_TO_ASSETS",
-            "RECOGNIZED_ASSETS",
-        ),
-        True,
-    ),
+    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "市场风险", "利率风险/认可资产率", ("INTEREST_RATE_RISK_TO_ASSETS",)),
+    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "市场风险", "权益价格风险/认可资产率", ("EQUITY_RISK_TO_ASSETS",)),
     NavigationEntry(
         MINIMUM_CAPITAL_LEVEL,
         "信用风险",
@@ -290,22 +297,27 @@ COMPANY_NAVIGATION: tuple[NavigationEntry, ...] = (
         ),
         True,
     ),
+    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "信用风险", "利差风险/认可资产率", ("SPREAD_RISK_TO_ASSETS",)),
+    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "信用风险", "对手违约风险/认可资产率", ("COUNTERPARTY_RISK_TO_ASSETS",)),
     NavigationEntry(
-        MINIMUM_CAPITAL_LEVEL,
-        "信用风险",
-        CREDIT_RISK_ASSET_SCATTER,
+        RECOGNIZED_ASSETS_LEVEL,
+        "资产构成情况",
+        "认可资产构成",
         (
-            "SPREAD_RISK_TO_ASSETS", "COUNTERPARTY_RISK_TO_ASSETS",
-            "RECOGNIZED_ASSETS",
+            "CASH_LIQUID_ASSETS", "INVESTMENT_ASSETS",
+            "SUBSIDIARY_JV_ASSOCIATE_EQUITY", "REINSURANCE_ASSETS",
+            "RECEIVABLES_AND_PREPAYMENTS", "FIXED_ASSETS",
+            "LAND_USE_RIGHTS", "SEPARATE_ACCOUNT_ASSETS",
+            "OTHER_RECOGNIZED_ASSETS",
         ),
         True,
     ),
-    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "利率风险最低资本占认可资产率", "利率风险/认可资产率", ("INTEREST_RATE_RISK_TO_ASSETS",)),
-    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "权益价格风险最低资本占认可资产率", "权益价格风险/认可资产率", ("EQUITY_RISK_TO_ASSETS",)),
-    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "利差风险最低资本占认可资产率", "利差风险/认可资产率", ("SPREAD_RISK_TO_ASSETS",)),
-    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "对手违约风险最低资本占认可资产率", "对手违约风险/认可资产率", ("COUNTERPARTY_RISK_TO_ASSETS",)),
-    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "保险风险（寿）最低资本占认可负债率", "保险风险（寿）/认可负债率", ("LIFE_INSURANCE_RISK_TO_LIABILITIES",)),
-    NavigationEntry(MINIMUM_CAPITAL_LEVEL, "保险风险（非寿）最低资本占认可负债率", "保险风险（非寿）/认可负债率", ("NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",)),
+    NavigationEntry(OPERATING_QUALITY_LEVEL, "业务质量指标", "签单保费与新业务利润率", ("SIGNED_PREMIUM", "NEW_BUSINESS_MARGIN"), always_available=True),
+    NavigationEntry(OPERATING_QUALITY_LEVEL, "业务质量指标", "新业务价值与新业务价值率", ("NEW_BUSINESS_VALUE", "SIGNED_PREMIUM"), always_available=True),
+    NavigationEntry(OPERATING_QUALITY_LEVEL, "业务质量指标", "综合退保率", ("SURRENDER_RATE",), always_available=True),
+    NavigationEntry(OPERATING_QUALITY_LEVEL, "投资质量指标", "投资质量六指标雷达图", ("ROE", "ROA", "INVESTMENT_RETURN", "COMPREHENSIVE_INVESTMENT_RETURN", "THREE_YEAR_AVG_INVESTMENT_RETURN", "THREE_YEAR_AVG_COMPREHENSIVE_INVESTMENT_RETURN"), always_available=True),
+    NavigationEntry(OPERATING_QUALITY_LEVEL, "投资质量指标", "累计投资收益率与累计综合投资收益率", ("INVESTMENT_RETURN", "COMPREHENSIVE_INVESTMENT_RETURN"), always_available=True),
+    NavigationEntry(OPERATING_QUALITY_LEVEL, "投资质量指标", "近三年平均投资收益率与综合投资收益率", ("INVESTMENT_RETURN", "COMPREHENSIVE_INVESTMENT_RETURN", "THREE_YEAR_AVG_INVESTMENT_RETURN", "THREE_YEAR_AVG_COMPREHENSIVE_INVESTMENT_RETURN"), always_available=True),
     NavigationEntry(APPENDIX_LEVEL, "重大融资信息", "增资发债信息统计", (), always_available=True),
 )
 

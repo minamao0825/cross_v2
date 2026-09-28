@@ -17,6 +17,7 @@ from .solvency_navigation import (
 
 TRANSPARENT = "transparent"
 ANNUAL_REPORT_FONT = "Microsoft YaHei"
+COMPANY_PANEL_HEIGHT = 250
 ANNUAL_REPORT_PANEL_BORDER = "#EAEAEA"
 REGULATORY_LIMITS = {
     "CORE_SOLVENCY_RATIO": 50.0,
@@ -59,15 +60,15 @@ UNDISCLOSED_COLOR = "#B8BDC7"
 RESPONSIVE_BAR_WIDTH = alt.RelativeBandSize(0.72)
 TREND_LABEL_FORMATS = {
     "NON_LIFE_INSURANCE_RISK_TO_LIABILITIES": ",.5f",
-    "LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL": ".1%",
-    "NON_LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL": ".1%",
-    "MARKET_RISK_TO_QUANT_CAPITAL": ".1%",
-    "CREDIT_RISK_TO_QUANT_CAPITAL": ".1%",
-    "DIVERSIFICATION_EFFECT_TO_QUANT_CAPITAL": ".1%",
-    "LOSS_ABSORPTION_TO_QUANT_CAPITAL": ".1%",
+    "LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL": ",.1f",
+    "NON_LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL": ",.1f",
+    "MARKET_RISK_TO_QUANT_CAPITAL": ",.1f",
+    "CREDIT_RISK_TO_QUANT_CAPITAL": ",.1f",
+    "DIVERSIFICATION_EFFECT_TO_QUANT_CAPITAL": ",.1f",
+    "LOSS_ABSORPTION_TO_QUANT_CAPITAL": ",.1f",
 }
 TREND_AXIS_FORMATS = {
-    code: ".1%"
+    code: ",.1f"
     for code in (
         "LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL",
         "NON_LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL",
@@ -78,10 +79,14 @@ TREND_AXIS_FORMATS = {
     )
 }
 TREND_LABEL_THRESHOLDS = {
-    "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL": 0.4,
+    "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL": 40.0,
 }
 COMPACT_TREND_SCALE_CODES = {
     "NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",
+}
+COMPACT_POLICY_RATIO_CODES = {
+    "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL",
+    "POLICY_SURPLUS_TO_INSURANCE_LIABILITIES",
 }
 
 
@@ -91,6 +96,19 @@ def report_period_color_map(period_order: Iterable[str]) -> dict[str, str]:
     return {
         period: KPMG_PERIOD_CHART_COLORS[index % len(KPMG_PERIOD_CHART_COLORS)]
         for index, period in enumerate(periods)
+    }
+
+
+def report_period_combo_bar_color_map(
+    period_order: Iterable[str],
+    *,
+    line_color: str = "#FD349C",
+) -> dict[str, str]:
+    """Keep period bars distinct from the fixed line color in combo charts."""
+    colors = report_period_color_map(period_order)
+    return {
+        period: "#098E7E" if color.upper() == line_color.upper() else color
+        for period, color in colors.items()
     }
 
 
@@ -180,6 +198,61 @@ def _axis_title(frame: pd.DataFrame) -> str:
     return "数值" if not units else f"数值（{'、'.join(units)}）"
 
 
+def convert_multiple_units_to_percent(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert ratio multiples to their Step 7 display units without mutating source data."""
+    result = frame.copy()
+    if "数值" not in result or "单位" not in result:
+        return result
+    units = result["单位"].fillna("").astype(str).str.strip()
+    multiple_mask = units.eq("倍")
+    metric_codes = result.get(
+        "指标编码", pd.Series("", index=result.index)
+    ).fillna("").astype(str).str.strip()
+    non_life_liability_mask = metric_codes.eq(
+        "NON_LIFE_INSURANCE_RISK_TO_LIABILITIES"
+    )
+    permille_from_multiple = non_life_liability_mask & multiple_mask
+    permille_from_percent = non_life_liability_mask & units.isin({"%", "％"})
+    percent_mask = multiple_mask & ~non_life_liability_mask
+    if not (percent_mask | permille_from_multiple | permille_from_percent).any():
+        return result
+    numeric = pd.to_numeric(result["数值"], errors="coerce")
+    result["数值"] = numeric
+    result.loc[percent_mask, "数值"] = numeric.loc[percent_mask] * 100.0
+    result.loc[percent_mask, "单位"] = "%"
+    result.loc[permille_from_multiple, "数值"] = (
+        numeric.loc[permille_from_multiple] * 1000.0
+    )
+    result.loc[permille_from_percent, "数值"] = (
+        numeric.loc[permille_from_percent] * 10.0
+    )
+    result.loc[permille_from_multiple | permille_from_percent, "单位"] = "‰"
+    return result
+
+
+def _with_metric_value_labels(frame: pd.DataFrame, code: str) -> pd.DataFrame:
+    """Add visible value labels, including a percent sign for percentage rows."""
+    result = frame.copy()
+    numeric = pd.to_numeric(result.get("数值", pd.Series(dtype=float)), errors="coerce")
+    precision = (
+        0
+        if code == "SOLVENCY_RATIO_COMBO"
+        else 5
+        if code in COMPACT_TREND_SCALE_CODES
+        else 1
+        if code in TREND_AXIS_FORMATS
+        else 2
+    )
+    units = result.get("单位", pd.Series("", index=result.index)).fillna("").astype(str).str.strip()
+    result["数值标签"] = [
+        ""
+        if pd.isna(value)
+        else f"{float(value):,.{precision}f}{'%' if unit in {'%', '％'} else '‰' if unit == '‰' else ''}"
+        for value, unit in zip(numeric, units)
+    ]
+    return result
+
+
 def _company_scale(
     companies: Iterable[str],
     colors: Mapping[str, str],
@@ -238,6 +311,16 @@ def _responsive_bar_width(
     """Narrow bars gradually as more company panels share the same row."""
     count = _panel_density_count(panel_count, dense_layout)
     fraction = 0.56 if count >= 12 else 0.64 if count >= 8 else 0.68 if count >= 5 else 0.72
+    return alt.RelativeBandSize(fraction)
+
+
+def _responsive_grouped_bar_width(
+    panel_count: int,
+    dense_layout: bool = False,
+) -> alt.RelativeBandSize:
+    """Keep paired bars broad and nearly touching within each report period."""
+    count = _panel_density_count(panel_count, dense_layout)
+    fraction = 0.8 if count >= 12 else 0.86 if count >= 8 else 0.9 if count >= 5 else 0.94
     return alt.RelativeBandSize(fraction)
 
 
@@ -307,7 +390,9 @@ def _metric_rows(
     code: str,
     period_order: Iterable[str],
 ) -> tuple[pd.DataFrame, list[str], str]:
-    metric = _clean_numeric(frame[frame["指标编码"].astype(str).eq(code)])
+    metric = convert_multiple_units_to_percent(
+        _clean_numeric(frame[frame["指标编码"].astype(str).eq(code)])
+    )
     periods = list(period_order)
     if metric.empty:
         raise ValueError(f"指标 {code} 没有可绘制数据。")
@@ -329,6 +414,7 @@ def _metric_rows(
         default_unit = "" if disclosed_units.empty else disclosed_units.iloc[0]
         metric["单位"] = metric["单位"].fillna(default_unit)
     metric["披露状态"] = metric["数值"].notna().map({True: "已披露", False: "未披露"})
+    metric = _with_metric_value_labels(metric, code)
     return metric, periods, _metric_title(metric, code)
 
 
@@ -342,7 +428,13 @@ def _trend_y_domain(metric: pd.DataFrame, code: str) -> list[float]:
     low, high = min(values), max(values)
     span = high - low
     minimum_padding = 0.0000001 if code in COMPACT_TREND_SCALE_CODES else 0.01
-    padding = max(span * 0.08, max(abs(low), abs(high)) * 0.025, minimum_padding)
+    span_padding = 0.14 if code in COMPACT_POLICY_RATIO_CODES else 0.08
+    magnitude_padding = 0.06 if code in COMPACT_POLICY_RATIO_CODES else 0.025
+    padding = max(
+        span * span_padding,
+        max(abs(low), abs(high)) * magnitude_padding,
+        minimum_padding,
+    )
     return [low - padding, high + padding]
 
 
@@ -415,14 +507,14 @@ def _build_metric_trend_group(
     ).mark_text(tooltip=False, dy=-10, fontSize=10, fontWeight="bold", color="#0C233C").encode(
         x=alt.X("报告期:N", sort=periods),
         y=alt.Y("数值:Q"),
-        text=alt.Text("数值:Q", format=label_format),
+        text=alt.Text("数值标签:N"),
     )
     max_labels = base.transform_filter(alt.datum["是否全局最大"]).mark_text(
         tooltip=False, dy=-11, fontSize=10, fontWeight="bold", color="#0C233C",
-    ).encode(x=alt.X("报告期:N", sort=periods), y="数值:Q", text=alt.Text("数值:Q", format=label_format))
+    ).encode(x=alt.X("报告期:N", sort=periods), y="数值:Q", text=alt.Text("数值标签:N"))
     min_labels = base.transform_filter(alt.datum["是否全局最小"]).mark_text(
         tooltip=False, dy=11, baseline="top", fontSize=10, fontWeight="bold", color="#0C233C",
-    ).encode(x=alt.X("报告期:N", sort=periods), y="数值:Q", text=alt.Text("数值:Q", format=label_format))
+    ).encode(x=alt.X("报告期:N", sort=periods), y="数值:Q", text=alt.Text("数值标签:N"))
     trend_layers: list[alt.Chart] = [lines, points, highlight_labels, max_labels, min_labels]
     limit = REGULATORY_LIMITS.get(code)
     if limit is not None:
@@ -573,7 +665,7 @@ def build_company_bar_trend_chart(
     ).encode(
         x=alt.X("报告期:N", sort=periods, scale=period_scale),
         y=alt.Y("数值:Q", scale=y_scale),
-        text=alt.Text("数值:Q", format=",.2f"),
+        text=alt.Text("数值标签:N"),
     )
     layers: list[alt.Chart] = [bars, line, points, labels]
     limit = REGULATORY_LIMITS.get(code)
@@ -686,7 +778,7 @@ def build_company_period_bar_chart(
     ).encode(
         x=alt.X("报告期:N", sort=periods, scale=period_scale),
         y=alt.Y("数值:Q", scale=y_scale),
-        text=alt.Text("数值:Q", format=value_format),
+        text=alt.Text("数值标签:N"),
     )
     layers: list[alt.Chart] = [bars, labels]
     limit = REGULATORY_LIMITS.get(code)
@@ -708,10 +800,10 @@ def metric_bar_axis_domain(
 ) -> tuple[float, float]:
     """Return one padded bar domain shared by every displayed company."""
     periods = {str(period) for period in period_order}
-    rows = frame[
+    rows = convert_multiple_units_to_percent(frame[
         frame["指标编码"].astype(str).eq(str(code))
         & frame["报告期"].astype(str).isin(periods)
-    ]
+    ])
     values = pd.to_numeric(rows.get("数值", pd.Series(dtype=float)), errors="coerce").dropna()
     if values.empty:
         return 0.0, 1.0
@@ -728,12 +820,12 @@ def solvency_ratio_axis_domain(
 ) -> tuple[float, float]:
     """Return one padded percentage domain shared by all displayed companies."""
     periods = {str(period) for period in period_order}
-    rows = frame[
+    rows = convert_multiple_units_to_percent(frame[
         frame["指标编码"].astype(str).isin(
             ("CORE_SOLVENCY_RATIO", "COMBINED_SOLVENCY_RATIO")
         )
         & frame["报告期"].astype(str).isin(periods)
-    ].copy()
+    ]).copy()
     values = pd.to_numeric(rows.get("数值", pd.Series(dtype=float)), errors="coerce")
     maximum = max(100.0, float(values.max())) if values.notna().any() else 100.0
     upper = max(125.0, math.ceil(maximum * 1.12 / 25.0) * 25.0)
@@ -751,7 +843,10 @@ def build_solvency_ratio_combo_chart(
     """Return one company panel with combined-ratio bars and a core-ratio line."""
     periods = list(dict.fromkeys(str(period) for period in period_order))
     codes = ("CORE_SOLVENCY_RATIO", "COMBINED_SOLVENCY_RATIO")
-    metric = _clean_numeric(frame[frame["指标编码"].astype(str).isin(codes)])
+    metric = convert_multiple_units_to_percent(
+        _clean_numeric(frame[frame["指标编码"].astype(str).isin(codes)])
+    )
+    metric = _with_metric_value_labels(metric, "SOLVENCY_RATIO_COMBO")
     metric = metric[metric["报告期"].astype(str).isin(periods)].copy()
     companies = list(dict.fromkeys(metric["公司"].dropna().astype(str)))
     if len(companies) != 1:
@@ -773,7 +868,7 @@ def build_solvency_ratio_combo_chart(
         dense_layout,
     )
     period_scale = _compact_period_scale(panel_count, dense_layout)
-    period_colors = report_period_color_map(periods)
+    period_colors = report_period_combo_bar_color_map(periods)
     x = alt.X(
         "报告期:N",
         title=None,
@@ -820,7 +915,7 @@ def build_solvency_ratio_combo_chart(
     ).encode(
         x=x,
         y=alt.Y("数值:Q", scale=y_scale),
-        text=alt.Text("数值:Q", format=",.0f"),
+        text=alt.Text("数值标签:N"),
     )
     line = alt.Chart(core).mark_line(
         color="#FD349C",
@@ -848,7 +943,7 @@ def build_solvency_ratio_combo_chart(
     ).encode(
         x=x,
         y=alt.Y("数值:Q", axis=None, scale=y_scale),
-        text=alt.Text("数值:Q", format=",.0f"),
+        text=alt.Text("数值标签:N"),
     )
     return _transparent(
         alt.layer(
@@ -857,7 +952,7 @@ def build_solvency_ratio_combo_chart(
             line,
             points,
             line_labels,
-        ).properties(title=company, height=250)
+        ).properties(title=company, height=COMPANY_PANEL_HEIGHT)
     )
 
 
@@ -873,8 +968,11 @@ def build_capital_ratio_combo_chart(
     shared_amount_domain: tuple[float, float] | None = None,
     dense_layout: bool = False,
     panel_count: int = 1,
+    bar_layout: str = "stacked",
 ) -> alt.Chart:
-    """Build one company panel: ratio line above stacked capital bars."""
+    """Build one company panel: ratio line above stacked or grouped capital bars."""
+    if bar_layout not in {"stacked", "grouped"}:
+        raise ValueError("bar_layout must be 'stacked' or 'grouped'.")
     periods = list(period_order)
     source_codes = tuple(code for codes in amount_groups.values() for code in codes)
     source = _clean_numeric(frame[frame["指标编码"].astype(str).isin(source_codes)])
@@ -917,12 +1015,19 @@ def build_capital_ratio_combo_chart(
         dense_layout,
     )
     components = _signed_stack_positions(components, "数值", "组成顺序")
+    if bar_layout == "grouped":
+        components["标签位置"] = pd.to_numeric(components["数值"], errors="coerce") / 2
     components["数值标签"] = components.apply(
         lambda row: (
             ""
             if pd.isna(row["数值"])
-            or pd.isna(row["构成占比"])
-            or abs(float(row["构成占比"])) < MIN_INSIDE_LABEL_SHARE
+            or (
+                bar_layout == "stacked"
+                and (
+                    pd.isna(row["构成占比"])
+                    or abs(float(row["构成占比"])) < MIN_INSIDE_LABEL_SHARE
+                )
+            )
             else _whole_number_label(row["数值"])
         ),
         axis=1,
@@ -937,9 +1042,13 @@ def build_capital_ratio_combo_chart(
         wide["线值"] = wide[first_label] / total.where(total.ne(0)) * 100
         line_rows = wide[["公司", "报告期", "线值"]].dropna().copy()
     else:
-        line_rows = _clean_numeric(
-            frame[frame["指标编码"].astype(str).eq(ratio_code)]
-        )[["公司", "报告期", "数值"]].drop_duplicates(["公司", "报告期"], keep="last")
+        line_rows = convert_multiple_units_to_percent(
+            _clean_numeric(
+                frame[frame["指标编码"].astype(str).eq(ratio_code)]
+            )
+        )[["公司", "报告期", "数值"]].drop_duplicates(
+            ["公司", "报告期"], keep="last"
+        )
         line_rows = line_rows.rename(columns={"数值": "线值"})
     line_rows["线标签"] = line_rows["线值"].map(
         lambda value: "" if pd.isna(value) else f"{float(value):,.1f}%"
@@ -982,38 +1091,67 @@ def build_capital_ratio_combo_chart(
         frame,
         amount_groups,
         periods,
+        stacked=bar_layout == "stacked",
     )
     amount_scale = alt.Scale(domain=list(amount_domain), zero=True, nice=False)
     combo_period_scale = _compact_period_scale(panel_count, dense_layout)
-    bars = alt.Chart(components).mark_bar(
-        width=_responsive_bar_width(panel_count, dense_layout)
-    ).encode(
-        x=alt.X(
-            "报告期:N",
-            sort=periods,
-            axis=period_axis,
-            scale=combo_period_scale,
+    period_x = alt.X(
+        "报告期:N",
+        sort=periods,
+        axis=period_axis,
+        scale=combo_period_scale,
+    )
+    category_offset = alt.XOffset(
+        "组成类别:N",
+        sort=labels,
+        scale=alt.Scale(paddingInner=0.0, paddingOuter=0.04),
+    )
+    bar_encoding: dict[str, object] = {
+        "x": period_x,
+        "y": alt.Y(
+            "堆叠终点:Q" if bar_layout == "stacked" else "数值:Q",
+            axis=amount_axis,
+            scale=amount_scale,
+            stack=None,
         ),
-        y=alt.Y("堆叠终点:Q", axis=amount_axis, scale=amount_scale),
-        y2=alt.Y2("堆叠起点:Q"),
-        color=alt.Color(
+        "color": alt.Color(
             "组成类别:N",
             scale=alt.Scale(domain=labels, range=colors),
             legend=None,
         ),
-        tooltip=["公司:N", "报告期:N", "组成类别:N", alt.Tooltip("数值:Q", format=",.2f"), "单位:N"],
-    )
+        "tooltip": [
+            "公司:N",
+            "报告期:N",
+            "组成类别:N",
+            alt.Tooltip("数值:Q", format=",.2f"),
+            "单位:N",
+        ],
+    }
+    if bar_layout == "stacked":
+        bar_encoding["y2"] = alt.Y2("堆叠起点:Q")
+    else:
+        bar_encoding["xOffset"] = category_offset
+    bars = alt.Chart(components).mark_bar(
+        width=(
+            _responsive_grouped_bar_width(panel_count, dense_layout)
+            if bar_layout == "grouped"
+            else _responsive_bar_width(panel_count, dense_layout)
+        )
+    ).encode(**bar_encoding)
+    label_encoding: dict[str, object] = {
+        "x": alt.X("报告期:N", sort=periods, scale=combo_period_scale),
+        "y": alt.Y("标签位置:Q", axis=amount_axis, scale=amount_scale),
+        "text": "数值标签:N",
+        "color": alt.Color("标签颜色:N", scale=None, legend=None),
+    }
+    if bar_layout == "grouped":
+        label_encoding["xOffset"] = category_offset
     inside_labels = alt.Chart(components).mark_text(
         tooltip=False,
         fontSize=value_font_size,
         fontWeight="bold",
         baseline="middle",
-    ).encode(
-        x=alt.X("报告期:N", sort=periods, scale=combo_period_scale),
-        y=alt.Y("标签位置:Q", axis=amount_axis, scale=amount_scale),
-        text="数值标签:N",
-        color=alt.Color("标签颜色:N", scale=None, legend=None),
-    )
+    ).encode(**label_encoding)
     bar_panel = alt.layer(bars, inside_labels).properties(height=190)
     if line_rows.empty:
         return _transparent(bar_panel.properties(title=company))
@@ -1078,8 +1216,10 @@ def capital_ratio_amount_axis_domain(
     frame: pd.DataFrame,
     amount_groups: Mapping[str, tuple[str, ...]],
     period_order: Iterable[str],
+    *,
+    stacked: bool = True,
 ) -> tuple[float, float]:
-    """Return one amount domain covering every displayed company's stack."""
+    """Return one shared amount domain for stacked totals or individual bars."""
     periods = {str(period) for period in period_order}
     source_codes = tuple(code for codes in amount_groups.values() for code in codes)
     source = _clean_numeric(frame[frame["指标编码"].astype(str).isin(source_codes)])
@@ -1101,8 +1241,12 @@ def capital_ratio_amount_axis_domain(
             if any(pd.isna(value) for value in values):
                 continue
             group_value = float(sum(values))
-            positive_total += max(group_value, 0.0)
-            negative_total += min(group_value, 0.0)
+            if stacked:
+                positive_total += max(group_value, 0.0)
+                negative_total += min(group_value, 0.0)
+            else:
+                positive_total = max(positive_total, max(group_value, 0.0))
+                negative_total = min(negative_total, min(group_value, 0.0))
             has_value = True
         if has_value:
             positive_totals.append(positive_total)
@@ -1216,6 +1360,7 @@ def component_stack_proportion_axis_domain(
     label_ratio_codes: Mapping[str, str] | None = None,
     label_denominator_code: str = "",
     negative_component_codes: Iterable[str] = (),
+    show_small_negative_labels: bool = False,
 ) -> tuple[float, float]:
     """Return one signed ratio-stack domain shared by every displayed company."""
     codes = {str(code) for code, _, _ in component_specs}
@@ -1257,6 +1402,13 @@ def component_stack_proportion_axis_domain(
     upper = max(0.0, float(totals["正向占比"].max()))
     padded_lower = lower * 1.08 if lower < 0 else 0.0
     padded_upper = upper * 1.08 if upper > 0 else 1.0
+    if show_small_negative_labels:
+        small_negative = rows["绘图占比"].lt(0) & rows["绘图占比"].abs().lt(MIN_INSIDE_LABEL_SHARE)
+        counts = small_negative.groupby([rows["公司"], rows["报告期"]]).sum()
+        if counts.max() > 0:
+            # Reserve annotation space without enlarging the actual bar values.
+            label_step = 0.08 * max(padded_upper, abs(lower), 1.0)
+            padded_lower = min(padded_lower, lower - label_step * (int(counts.max()) + 1))
     return float(padded_lower), float(padded_upper)
 
 
@@ -1275,6 +1427,8 @@ def build_component_stack_chart(
     shared_y_domain: tuple[float, float] | None = None,
     plot_proportions: bool = False,
     min_label_share: float | None = None,
+    hide_labels_at_threshold: bool = False,
+    show_small_negative_labels: bool = False,
 ) -> alt.Chart:
     """Build a signed component stack with KPMG-only semantic colors."""
     label_share_threshold = (
@@ -1282,6 +1436,15 @@ def build_component_stack_chart(
         if min_label_share is None
         else max(0.0, float(min_label_share))
     )
+    def hide_share_label(value: object) -> bool:
+        if pd.isna(value):
+            return True
+        share = abs(float(value))
+        return (
+            share <= label_share_threshold
+            if hide_labels_at_threshold
+            else share < label_share_threshold
+        )
     specs = list(component_specs)
     labels = [label for _, label, _ in specs]
     colors = [color for _, _, color in specs]
@@ -1311,8 +1474,7 @@ def build_component_stack_chart(
             lambda row: (
                 ""
                 if pd.isna(row["数值"])
-                or pd.isna(row["构成占比"])
-                or abs(float(row["构成占比"])) < label_share_threshold
+                or hide_share_label(row["构成占比"])
                 else _whole_number_label(row["数值"])
             ),
             axis=1,
@@ -1327,7 +1489,7 @@ def build_component_stack_chart(
         rows["占比标签"] = rows["构成占比"].map(
             lambda value: (
                 ""
-                if pd.isna(value) or abs(float(value)) < label_share_threshold
+                if hide_share_label(value)
                 else _whole_percent_label(value)
             )
         )
@@ -1347,7 +1509,7 @@ def build_component_stack_chart(
         rows["占比标签"] = rows["构成占比"].map(
             lambda value: (
                 ""
-                if pd.isna(value) or abs(float(value)) < label_share_threshold
+                if hide_share_label(value)
                 else _whole_percent_label(value)
             )
         )
@@ -1368,6 +1530,7 @@ def build_component_stack_chart(
             label_ratio_codes=ratio_codes,
             label_denominator_code=label_denominator_code,
             negative_component_codes=negative_component_codes,
+            show_small_negative_labels=show_small_negative_labels,
         )
         if plot_proportions
         else component_stack_axis_domain(
@@ -1378,6 +1541,20 @@ def build_component_stack_chart(
         )
     )
     y_scale = alt.Scale(domain=list(stack_domain), zero=True, nice=False)
+    rows["小额负值注释"] = False
+    if plot_proportions and show_small_negative_labels:
+        small_negative = rows["绘图占比"].lt(0) & rows["绘图占比"].abs().lt(MIN_INSIDE_LABEL_SHARE)
+        rows.loc[small_negative, "小额负值注释"] = True
+        # Keep the signed stack endpoints exact; only move the text below it.
+        negative_floor = rows.groupby(["公司", "报告期"])["堆叠终点"].transform("min").clip(upper=0)
+        ranks = small_negative.groupby([rows["公司"], rows["报告期"]]).cumsum()
+        label_step = 0.08 * max(stack_domain[1], abs(float(negative_floor.min())), 1.0)
+        rows.loc[small_negative, "标签位置"] = (negative_floor - ranks * label_step)[small_negative]
+        rows.loc[small_negative, "占比标签"] = rows.loc[small_negative, "绘图占比"].map(
+            lambda value: f"{value * 100:.2f}%" if abs(value) >= 0.0001 else f"{value * 100:.2g}%"
+        )
+        rows.loc[small_negative, "标签颜色"] = "#0C233C"
+        rows["注释引线终点"] = rows["标签位置"] + label_step * 0.3
     panel_height = 285
     base = alt.Chart()
     tooltips: list[alt.Tooltip | str] = [
@@ -1387,7 +1564,7 @@ def build_component_stack_chart(
         alt.Tooltip("数值:Q", format=",.2f"),
     ]
     if not value_labels:
-        tooltips.append(alt.Tooltip("构成占比:Q", format=".1%"))
+        tooltips.append(alt.Tooltip("构成占比:Q", format=".2%"))
     tooltips.append("单位:N")
     bars = base.mark_bar(
         width=_responsive_bar_width(density_count, dense_layout)
@@ -1409,6 +1586,7 @@ def build_component_stack_chart(
             title=None,
             axis=_hidden_value_axis(),
             scale=y_scale,
+            stack=None,
         ),
         y2=alt.Y2("堆叠起点:Q"),
         color=alt.Color(
@@ -1432,11 +1610,22 @@ def build_component_stack_chart(
     zero = alt.Chart(pd.DataFrame({"零线": [0]})).mark_rule(
         color="#0C233C", strokeWidth=1
     ).encode(y=alt.Y("零线:Q", scale=y_scale))
-    chart = alt.layer(bars, labels_chart, zero, data=rows).properties(width=panel_width, height=panel_height)
+    layers = [bars, labels_chart, zero]
+    if plot_proportions and show_small_negative_labels:
+        leaders = base.transform_filter(alt.datum["小额负值注释"]).mark_rule(
+            color="#65758B", strokeWidth=1,
+        ).encode(
+            x=alt.X("报告期:N", sort=periods, scale=period_scale),
+            y=alt.Y("堆叠终点:Q", scale=y_scale),
+            y2=alt.Y2("注释引线终点:Q"),
+            tooltip=tooltips,
+        )
+        layers.append(leaders)
+    chart = alt.layer(*layers, data=rows).properties(width=panel_width, height=panel_height)
     if company_count == 1:
         company = str(rows["公司"].dropna().astype(str).iloc[0])
         return _transparent(
-            alt.layer(bars, labels_chart, zero, data=rows).properties(
+            alt.layer(*layers, data=rows).properties(
                 height=270,
                 title=company,
             )
@@ -1676,7 +1865,7 @@ def build_capital_efficiency_bubble_chart(
     linked_selection_name: str = "",
     zoom_domain_override: Mapping[str, Iterable[float]] | None = None,
 ) -> tuple[alt.Chart, str]:
-    """Plot latest-period capital efficiency, core/registered capital, and assets."""
+    """Plot latest-period actual/registered and core/registered capital with asset size."""
     periods = list(dict.fromkeys(str(period) for period in period_order))
     if not periods:
         raise ValueError("缺少可绘制的报告期。")
@@ -1717,8 +1906,8 @@ def build_capital_efficiency_bubble_chart(
         pivot["REGISTERED_CAPITAL"].ne(0)
         & pivot["RECOGNIZED_ASSETS"].ne(0)
     ].copy()
-    pivot["实际资本/认可资产"] = (
-        pivot["ACTUAL_CAPITAL"] / pivot["RECOGNIZED_ASSETS"]
+    pivot["实际资本/注册资本"] = (
+        pivot["ACTUAL_CAPITAL"] / pivot["REGISTERED_CAPITAL"]
     )
     pivot["核心资本/注册资本"] = (
         (pivot["CORE_T1_CAPITAL"] + pivot["CORE_T2_CAPITAL"])
@@ -1727,21 +1916,21 @@ def build_capital_efficiency_bubble_chart(
     pivot["认可资产"] = pivot["RECOGNIZED_ASSETS"]
     pivot["气泡大小"] = pivot["RECOGNIZED_ASSETS"].abs()
     pivot["报告期"] = latest_period
-    finite_columns = ["实际资本/认可资产", "核心资本/注册资本", "气泡大小"]
+    finite_columns = ["实际资本/注册资本", "核心资本/注册资本", "气泡大小"]
     finite_mask = pivot[finite_columns].apply(
         lambda column: column.map(lambda value: math.isfinite(float(value)))
     ).all(axis=1)
     pivot = pivot[finite_mask & pivot["气泡大小"].gt(0)].copy()
     if pivot.empty:
         raise ValueError(f"{latest_period} 缺少可绘制的完整公司数据。")
-    full_sample_x_median = float(pivot["实际资本/认可资产"].median())
+    full_sample_x_median = float(pivot["实际资本/注册资本"].median())
     full_sample_y_median = float(pivot["核心资本/注册资本"].median())
     zoom_domain_source = pivot
     zoom_applied = False
     highlight = str(highlight_company or "").strip()
 
     if zoom_to_overlap_region and len(pivot) >= 2:
-        x_field = "实际资本/认可资产"
+        x_field = "实际资本/注册资本"
         y_field = "核心资本/注册资本"
         x_span = max(float(pivot[x_field].max() - pivot[x_field].min()), 1e-9)
         y_span = max(float(pivot[y_field].max() - pivot[y_field].min()), 1e-9)
@@ -1818,7 +2007,7 @@ def build_capital_efficiency_bubble_chart(
                 zoom_applied = True
 
     pivot = pivot.sort_values(
-        ["实际资本/认可资产", "核心资本/注册资本"],
+        ["实际资本/注册资本", "核心资本/注册资本"],
         kind="stable",
     ).reset_index(drop=True)
 
@@ -1881,7 +2070,7 @@ def build_capital_efficiency_bubble_chart(
         )
         return [lower - padding, upper + padding]
 
-    x_domain = padded_domain("实际资本/认可资产")
+    x_domain = padded_domain("实际资本/注册资本")
     y_domain = padded_domain("核心资本/注册资本")
 
     def overridden_domain(key: str, fallback: list[float]) -> list[float]:
@@ -1915,7 +2104,7 @@ def build_capital_efficiency_bubble_chart(
         y_scale = alt.Scale(domain=y_domain, zero=False, nice=False)
     border_color = "#D9DEE7"
     reference_color = "#C9CED6"
-    x_title = "实际资本/认可资产（%）" if show_axis_titles else ""
+    x_title = "实际资本/注册资本（%）" if show_axis_titles else ""
     y_title = "核心资本/注册资本（%）" if show_axis_titles else ""
     x_axis = alt.Axis(
         title=x_title,
@@ -1950,7 +2139,7 @@ def build_capital_efficiency_bubble_chart(
         clip=zoom_to_overlap_region,
     ).encode(
         x=alt.X(
-            "实际资本/认可资产:Q",
+            "实际资本/注册资本:Q",
             title=x_title,
             axis=x_axis,
             scale=x_scale,
@@ -1981,7 +2170,7 @@ def build_capital_efficiency_bubble_chart(
             "公司:N",
             "同业分类:N",
             "报告期:N",
-            alt.Tooltip("实际资本/认可资产:Q", format=".1%"),
+            alt.Tooltip("实际资本/注册资本:Q", format=".1%"),
             alt.Tooltip("核心资本/注册资本:Q", format=".1%"),
             alt.Tooltip("认可资产:Q", title=size_title, format=",.2f"),
         ],

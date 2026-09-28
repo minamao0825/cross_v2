@@ -28,6 +28,8 @@ from services.solvency_navigation import (
     MARKET_RISK_ASSET_SCATTER,
     OVERVIEW_LEVEL,
     PRINT_ALL_LABEL,
+    RECOGNIZED_ASSETS_LEVEL,
+    OPERATING_QUALITY_LEVEL,
     apply_navigation_labels,
     chart_names,
     first_levels_for_codes,
@@ -46,6 +48,8 @@ class SolvencyNavigationTests(unittest.TestCase):
                 COMPANY_OVERVIEW_LEVEL,
                 ACTUAL_CAPITAL_LEVEL,
                 MINIMUM_CAPITAL_LEVEL,
+                RECOGNIZED_ASSETS_LEVEL,
+                OPERATING_QUALITY_LEVEL,
                 APPENDIX_LEVEL,
                 PRINT_ALL_LABEL,
             ),
@@ -53,9 +57,13 @@ class SolvencyNavigationTests(unittest.TestCase):
         self.assertEqual(INDUSTRY_FIRST_LEVELS, (OVERVIEW_LEVEL, PRINT_ALL_LABEL))
         self.assertEqual(second_levels(ACTUAL_CAPITAL_LEVEL)[0], "行业资本分级")
         self.assertIn("资本规模与结构", chart_names(ACTUAL_CAPITAL_LEVEL, "全部"))
-        self.assertIn("核心资本明细占比-待定", chart_names(ACTUAL_CAPITAL_LEVEL, "全部"))
+        self.assertIn("核心一级资本明细", chart_names(ACTUAL_CAPITAL_LEVEL, "全部"))
         policy_surplus_charts = chart_names(ACTUAL_CAPITAL_LEVEL, "保单未来盈余")
         self.assertIn("计入各级资本的保单未来盈余构成占比", policy_surplus_charts)
+        self.assertNotIn(
+            "计入核心资本的保单未来盈余/核心资本的比例",
+            policy_surplus_charts,
+        )
         self.assertNotIn("各级资本中的保单未来盈余占比", policy_surplus_charts)
         self.assertIn("量化风险最低资本构成", chart_names(MINIMUM_CAPITAL_LEVEL, "全部"))
         quant_codes = metric_codes_for_chart("量化风险最低资本构成")
@@ -69,49 +77,89 @@ class SolvencyNavigationTests(unittest.TestCase):
         self.assertNotIn("各类信用风险", chart_names(MINIMUM_CAPITAL_LEVEL, "信用风险"))
         credit_codes = metric_codes_for_chart("各类信用风险占比")
         self.assertIn("CREDIT_RISK_CAPITAL", credit_codes)
-        self.assertIn(
-            MARKET_RISK_ASSET_SCATTER,
-            chart_names(MINIMUM_CAPITAL_LEVEL, "市场风险"),
-        )
+        self.assertIn("认可资产构成", chart_names(RECOGNIZED_ASSETS_LEVEL, "全部"))
         self.assertEqual(
-            metric_codes_for_chart(MARKET_RISK_ASSET_SCATTER),
+            metric_codes_for_chart("认可资产构成"),
             (
-                "INTEREST_RATE_RISK_TO_ASSETS",
-                "EQUITY_RISK_TO_ASSETS",
-                "RECOGNIZED_ASSETS",
+                "CASH_LIQUID_ASSETS", "INVESTMENT_ASSETS",
+                "SUBSIDIARY_JV_ASSOCIATE_EQUITY", "REINSURANCE_ASSETS",
+                "RECEIVABLES_AND_PREPAYMENTS", "FIXED_ASSETS",
+                "LAND_USE_RIGHTS", "SEPARATE_ACCOUNT_ASSETS",
+                "OTHER_RECOGNIZED_ASSETS",
             ),
         )
-        self.assertIn(
-            CREDIT_RISK_ASSET_SCATTER,
-            chart_names(MINIMUM_CAPITAL_LEVEL, "信用风险"),
-        )
         self.assertEqual(
-            metric_codes_for_chart(CREDIT_RISK_ASSET_SCATTER),
-            (
-                "SPREAD_RISK_TO_ASSETS",
-                "COUNTERPARTY_RISK_TO_ASSETS",
-                "RECOGNIZED_ASSETS",
-            ),
-        )
-        self.assertIn(
-            "各类保险风险（寿）占比",
             chart_names(MINIMUM_CAPITAL_LEVEL, "保险风险"),
+            [
+                "各类保险风险（寿）占比",
+                "保险风险（寿）/认可负债率",
+                "保险风险（非寿）/认可负债率",
+            ],
         )
         self.assertNotIn(
             "各类保险风险（寿）占比",
             chart_names(MINIMUM_CAPITAL_LEVEL, "保险风险（寿）"),
         )
-        self.assertIn(
-            INSURANCE_RISK_LIABILITY_SCATTER,
-            chart_names(MINIMUM_CAPITAL_LEVEL, "保险风险"),
+        self.assertEqual(
+            chart_names(MINIMUM_CAPITAL_LEVEL, "市场风险"),
+            [
+                "各类市场风险占比",
+                "利率风险/认可资产率",
+                "权益价格风险/认可资产率",
+            ],
         )
         self.assertEqual(
-            metric_codes_for_chart(INSURANCE_RISK_LIABILITY_SCATTER),
-            (
-                "LIFE_INSURANCE_RISK_TO_LIABILITIES",
-                "NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",
-                "RECOGNIZED_LIABILITIES",
-            ),
+            chart_names(MINIMUM_CAPITAL_LEVEL, "信用风险"),
+            [
+                "各类信用风险占比",
+                "利差风险/认可资产率",
+                "对手违约风险/认可资产率",
+            ],
+        )
+        removed_scatter_charts = {
+            MARKET_RISK_ASSET_SCATTER,
+            CREDIT_RISK_ASSET_SCATTER,
+            INSURANCE_RISK_LIABILITY_SCATTER,
+        }
+        self.assertTrue(removed_scatter_charts.isdisjoint(
+            chart_names(MINIMUM_CAPITAL_LEVEL, "全部")
+        ))
+        for chart_name in removed_scatter_charts:
+            self.assertEqual(metric_codes_for_chart(chart_name), ())
+        removed_ratio_sections = {
+            "利率风险最低资本占认可资产率",
+            "权益价格风险最低资本占认可资产率",
+            "利差风险最低资本占认可资产率",
+            "对手违约风险最低资本占认可资产率",
+            "保险风险（寿）最低资本占认可负债率",
+            "保险风险（非寿）最低资本占认可负债率",
+        }
+        self.assertTrue(removed_ratio_sections.isdisjoint(
+            second_levels(MINIMUM_CAPITAL_LEVEL)
+        ))
+        self.assertEqual(
+            metric_codes_for_chart("保险风险（寿）/认可负债率"),
+            ("LIFE_INSURANCE_RISK_TO_LIABILITIES",),
+        )
+        self.assertEqual(
+            metric_codes_for_chart("保险风险（非寿）/认可负债率"),
+            ("NON_LIFE_INSURANCE_RISK_TO_LIABILITIES",),
+        )
+        self.assertEqual(
+            metric_codes_for_chart("利率风险/认可资产率"),
+            ("INTEREST_RATE_RISK_TO_ASSETS",),
+        )
+        self.assertEqual(
+            metric_codes_for_chart("权益价格风险/认可资产率"),
+            ("EQUITY_RISK_TO_ASSETS",),
+        )
+        self.assertEqual(
+            metric_codes_for_chart("利差风险/认可资产率"),
+            ("SPREAD_RISK_TO_ASSETS",),
+        )
+        self.assertEqual(
+            metric_codes_for_chart("对手违约风险/认可资产率"),
+            ("COUNTERPARTY_RISK_TO_ASSETS",),
         )
         self.assertEqual(
             metric_codes_for_chart("核心资本/注册资本"),
@@ -160,6 +208,20 @@ class SolvencyNavigationTests(unittest.TestCase):
         capital_ratio_charts = chart_names(COMPANY_OVERVIEW_LEVEL, "资本充足率")
         self.assertIn("核心及综合充足率", capital_ratio_charts)
         self.assertIn("核心资本占比", capital_ratio_charts)
+        policy_surplus_ratio_chart = "计入核心资本的保单未来盈余/核心资本的比例"
+        core_share_index = capital_ratio_charts.index("核心资本占比")
+        self.assertEqual(
+            capital_ratio_charts[core_share_index + 1],
+            policy_surplus_ratio_chart,
+        )
+        self.assertEqual(
+            chart_names(COMPANY_OVERVIEW_LEVEL, "保单未来盈余"),
+            [policy_surplus_ratio_chart],
+        )
+        self.assertEqual(
+            chart_names(COMPANY_OVERVIEW_LEVEL, "全部").count(policy_surplus_ratio_chart),
+            1,
+        )
         self.assertEqual(
             capital_ratio_charts[-1],
             "资本使用效率与核心资本占比气泡图",
@@ -274,7 +336,7 @@ class SolvencyNavigationTests(unittest.TestCase):
         self.assertEqual(result.iloc[0]["二级模块"], "资本充足率")
         self.assertEqual(result.iloc[1]["一级模块"], "保留一级")
 
-    def test_pending_capital_detail_entries_remain_visible_without_metrics(self):
+    def test_capital_detail_entries_remain_visible_without_metrics(self):
         available = {
             "CORE_T1_TO_ACTUAL_CAPITAL",
             "CORE_T2_TO_ACTUAL_CAPITAL",
@@ -285,8 +347,13 @@ class SolvencyNavigationTests(unittest.TestCase):
         self.assertIn("核心资本", second_levels(ACTUAL_CAPITAL_LEVEL, available_codes=available))
         self.assertEqual(
             chart_names(ACTUAL_CAPITAL_LEVEL, "核心资本", available_codes=available),
-            ["核心资本明细占比-待定"],
+            ["核心一级资本明细"],
         )
+
+    def test_operating_quality_remains_visible_for_undisclosed_companies(self):
+        self.assertIn(OPERATING_QUALITY_LEVEL, first_levels_for_codes([]))
+        self.assertEqual(second_levels(OPERATING_QUALITY_LEVEL), ["业务质量指标", "投资质量指标"])
+        self.assertEqual(len(chart_names(OPERATING_QUALITY_LEVEL, "全部", available_codes=[])), 6)
 
     def test_capital_stack_requires_all_four_metric_codes(self):
         only_core = {"CORE_T1_CAPITAL"}

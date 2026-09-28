@@ -12,6 +12,10 @@ from typing import Iterable
 import pandas as pd
 import streamlit as st
 
+from services.solvency_company_identity import (
+    display_company_names,
+    reconcile_known_company_aliases,
+)
 from services.solvency_financing_analysis import summarize_financing
 from services.solvency_navigation import KPMG_CATEGORIES
 from services.solvency_report_notes import (
@@ -236,7 +240,7 @@ def company_detail_rows(frame: pd.DataFrame | None) -> pd.DataFrame:
         | company_type.eq("行业合计")
         | company_code.str.startswith("INDUSTRY_")
     )
-    return result.loc[~industry & company.ne("")].copy()
+    return reconcile_known_company_aliases(result.loc[~industry & company.ne("")])
 
 
 def preferred_period_scope(frame: pd.DataFrame, requested: str = "") -> str:
@@ -651,18 +655,21 @@ def build_key_solvency_overview_table(
             prior_period = prior_candidate
     latest_label = latest_period or "本期"
     prior_label = prior_period or "上年同期"
-    comparison_label = f"{latest_label}-{prior_label}"
     columns = [
         "公司名称",
-        f"核心资本充足率%变化 {comparison_label}",
-        f"综合资本充足率%变化 {comparison_label}",
-        f"实际资本%变化 {comparison_label}",
-        f"最低资本%变化 {comparison_label}",
-        f"未来保单盈余%变化 {comparison_label}",
-        "保单未来盈余/核心资本比例",
-        "市场风险占比",
-        "保险风险占比",
-        f"认可负债余额%变化 {comparison_label}",
+        f"核心资本充足率{latest_label}",
+        f"核心资本充足率{prior_label}",
+        f"综合资本充足率{latest_label}",
+        f"综合资本充足率{prior_label}",
+        f"实际资本{latest_label}",
+        f"实际资本{prior_label}",
+        f"保单未来盈余{latest_label}",
+        f"保单未来盈余{prior_label}",
+        f"保单未来盈余/核心资本比例 {latest_label}",
+        f"市场风险占比 {latest_label}",
+        f"保险风险占比 {latest_label}",
+        f"认可负债余额{latest_label}",
+        f"认可负债余额{prior_label}",
     ]
     if detail.empty or not latest_period:
         return pd.DataFrame(columns=columns), latest_period, prior_period
@@ -708,15 +715,8 @@ def build_key_solvency_overview_table(
 
     def total(company: str, period: str, codes: Iterable[str]) -> float | None:
         values = [value(company, period, code) for code in codes]
-        return None if any(item is None for item in values) else float(sum(values))
-
-    def change(current: float | None, previous: float | None) -> float | None:
-        if current is None or previous in {None, 0}:
-            return None
-        return current / previous - 1
-
-    def difference(current: float | None, previous: float | None) -> float | None:
-        return None if current is None or previous is None else current - previous
+        disclosed_values = [item for item in values if item is not None]
+        return float(sum(disclosed_values)) if disclosed_values else None
 
     companies = list(dict.fromkeys(_text_series(detail, "公司")))
     rows: list[dict[str, object]] = []
@@ -742,30 +742,19 @@ def build_key_solvency_overview_table(
             )
         rows.append({
             "公司名称": company,
-            columns[1]: difference(
-                value(company, latest_period, "CORE_SOLVENCY_RATIO"),
-                value(company, prior_period, "CORE_SOLVENCY_RATIO"),
-            ),
-            columns[2]: difference(
-                value(company, latest_period, "COMBINED_SOLVENCY_RATIO"),
-                value(company, prior_period, "COMBINED_SOLVENCY_RATIO"),
-            ),
-            columns[3]: change(
-                value(company, latest_period, "ACTUAL_CAPITAL"),
-                value(company, prior_period, "ACTUAL_CAPITAL"),
-            ),
-            columns[4]: change(
-                value(company, latest_period, "MINIMUM_CAPITAL"),
-                value(company, prior_period, "MINIMUM_CAPITAL"),
-            ),
-            columns[5]: change(latest_policy, prior_policy),
-            columns[6]: core_ratio,
-            columns[7]: value(company, latest_period, "MARKET_RISK_TO_QUANT_CAPITAL"),
-            columns[8]: value(company, latest_period, "LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL"),
-            columns[9]: change(
-                value(company, latest_period, "RECOGNIZED_LIABILITIES"),
-                value(company, prior_period, "RECOGNIZED_LIABILITIES"),
-            ),
+            columns[1]: value(company, latest_period, "CORE_SOLVENCY_RATIO"),
+            columns[2]: value(company, prior_period, "CORE_SOLVENCY_RATIO"),
+            columns[3]: value(company, latest_period, "COMBINED_SOLVENCY_RATIO"),
+            columns[4]: value(company, prior_period, "COMBINED_SOLVENCY_RATIO"),
+            columns[5]: value(company, latest_period, "ACTUAL_CAPITAL"),
+            columns[6]: value(company, prior_period, "ACTUAL_CAPITAL"),
+            columns[7]: latest_policy,
+            columns[8]: prior_policy,
+            columns[9]: core_ratio,
+            columns[10]: value(company, latest_period, "MARKET_RISK_TO_QUANT_CAPITAL"),
+            columns[11]: value(company, latest_period, "LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL"),
+            columns[12]: value(company, latest_period, "RECOGNIZED_LIABILITIES"),
+            columns[13]: value(company, prior_period, "RECOGNIZED_LIABILITIES"),
         })
     return pd.DataFrame(rows, columns=columns), latest_period, prior_period
 
@@ -773,24 +762,78 @@ def build_key_solvency_overview_table(
 def build_key_solvency_overview_html(
     display: pd.DataFrame,
     highlight_company: str = "无",
+    *,
+    latest_period: str = "",
+    prior_period: str = "",
 ) -> str:
     """Render the overview with the annual-report platform's exact table styling."""
+    column_weights: list[float] = []
+    for index, column in enumerate(display.columns):
+        column_text = str(column)
+        if index == 0:
+            weight = 6.3
+        elif "保单未来盈余/核心资本比例" in column_text:
+            weight = 9.4
+        elif column_text.startswith("认可负债余额"):
+            weight = 8.2
+        elif column_text.startswith(("实际资本", "保单未来盈余")):
+            weight = 7.5
+        elif "风险占比" in column_text:
+            weight = 6.2
+        else:
+            weight = 6.7
+        column_weights.append(weight)
+    total_weight = sum(column_weights) or 1.0
+
     parts = [
-        "<div style='width:100%;overflow:visible;'>",
-        "<table class='key-solvency-overview' style='width:100%;border-collapse:collapse;"
-        "font-family:sans-serif;font-size:11px;margin-bottom:15px;'>",
-        "<thead><tr style='background-color:#00338D;color:white;text-align:center;font-weight:bold;'>",
+        "<style>"
+        ".key-solvency-overview-wrap{width:100%;max-width:100%;overflow:visible;}"
+        ".key-solvency-overview{width:100%;max-width:100%;table-layout:fixed;}"
+        ".key-solvency-overview th,.key-solvency-overview td{box-sizing:border-box;}"
+        "@media screen and (max-width:1400px){"
+        ".key-solvency-overview{font-size:9px!important;}"
+        ".key-solvency-overview th,.key-solvency-overview td{padding:3px 1px!important;font-size:9px!important;}"
+        "}"
+        "@media print{"
+        ".key-solvency-overview-wrap{width:100%!important;max-width:100%!important;overflow:visible!important;}"
+        ".key-solvency-overview{width:100%!important;min-width:0!important;max-width:100%!important;"
+        "table-layout:fixed!important;font-size:7pt!important;}"
+        ".key-solvency-overview thead{display:table-header-group;}"
+        ".key-solvency-overview tr{break-inside:avoid;page-break-inside:avoid;}"
+        ".key-solvency-overview th,.key-solvency-overview td{min-width:0!important;max-width:none!important;"
+        "padding:2pt 1pt!important;font-size:7pt!important;white-space:normal!important;"
+        "word-break:break-word!important;overflow-wrap:anywhere!important;}"
+        ".key-solvency-overview th:first-child,.key-solvency-overview td:first-child{"
+        "white-space:nowrap!important;word-break:keep-all!important;overflow-wrap:normal!important;}"
+        "}"
+        "</style>",
+        "<div class='key-solvency-overview-wrap'>",
+        "<table class='key-solvency-overview' style='width:100%;max-width:100%;table-layout:fixed;"
+        "border-collapse:collapse;font-family:sans-serif;font-size:10px;margin-bottom:15px;'>",
+        "<colgroup>",
     ]
+    for weight in column_weights:
+        parts.append(f"<col style='width:{weight / total_weight * 100:.3f}%;'>")
+    parts.append(
+        "</colgroup><thead><tr style='background-color:#00338D;color:white;"
+        "text-align:center;font-weight:bold;'>"
+    )
     for index, column in enumerate(display.columns):
         header = html.escape(str(column))
         if index:
-            header = header.replace("变化% ", "变化%<br>", 1)
-            header = header.replace("变化 ", "变化<br>", 1)
+            for period_token in (
+                latest_period or "本期",
+                prior_period or "上年同期",
+            ):
+                escaped_token = html.escape(period_token)
+                if escaped_token and header.endswith(escaped_token):
+                    header = f"{header[:-len(escaped_token)]}<br>{escaped_token}"
+                    break
         alignment = "left" if index == 0 else "center"
         nowrap = "white-space:nowrap;" if index == 0 else "white-space:normal;line-height:1.25;"
         parts.append(
-            f"<th style='padding:6px 4px;text-align:{alignment};border:1.5px solid white;"
-            f"font-size:11px;font-weight:bold;{nowrap}'>{header}</th>"
+            f"<th style='padding:5px 2px;text-align:{alignment};border:1.5px solid white;"
+            f"font-size:10px;font-weight:bold;overflow-wrap:anywhere;{nowrap}'>{header}</th>"
         )
     parts.append("</tr></thead><tbody>")
     tracked_company = str(highlight_company or "").strip()
@@ -818,7 +861,7 @@ def build_key_solvency_overview_html(
             nowrap = (
                 "white-space:nowrap;word-break:keep-all;overflow-wrap:normal;"
                 if column_index == 0
-                else "white-space:normal;line-height:1.25;"
+                else "white-space:nowrap;line-height:1.2;"
             )
             if is_highlight:
                 border = "border-top:1.5px solid #00338D;border-bottom:1.5px solid #00338D;"
@@ -831,7 +874,7 @@ def build_key_solvency_overview_html(
                 border = "border:1px solid #EAEAEA;"
                 weight = ""
             parts.append(
-                f"<td style='background-color:{background};padding:4px;font-size:11px;"
+                f"<td style='background-color:{background};padding:4px 2px;font-size:10px;"
                 f"{border}{weight}text-align:{alignment};color:{color};{nowrap}'>{text}</td>"
             )
         parts.append("</tr>")
@@ -842,13 +885,22 @@ def build_key_solvency_overview_html(
 def _format_key_solvency_overview_display(table: pd.DataFrame) -> pd.DataFrame:
     """Format the comparison table while preserving its underlying numeric values."""
     display = table.copy()
-    for column in display.columns[1:3]:
+    percent_point_prefixes = ("核心资本充足率", "综合资本充足率")
+    amount_prefixes = ("实际资本", "保单未来盈余", "认可负债余额")
+    for column in display.columns[1:]:
+        column_text = str(column)
+        if column_text.startswith(percent_point_prefixes):
+            formatter = lambda value: f"{float(value):.1f}%"
+        elif "保单未来盈余/核心资本比例" in column_text:
+            formatter = lambda value: f"{float(value):.1%}"
+        elif column_text.startswith(amount_prefixes):
+            formatter = lambda value: f"{float(value):,.2f}"
+        else:
+            formatter = lambda value: f"{float(value):.1%}"
         display[column] = display[column].map(
-            lambda value: "未披露" if pd.isna(value) else f"{float(value):.1f}%"
-        )
-    for column in display.columns[3:]:
-        display[column] = display[column].map(
-            lambda value: "未披露" if pd.isna(value) else f"{float(value):.1%}"
+            lambda value, format_value=formatter: (
+                "未披露" if pd.isna(value) else format_value(value)
+            )
         )
     return display
 
@@ -859,7 +911,6 @@ def render_key_solvency_overview(
     highlight_company: str = "无",
 ) -> pd.DataFrame:
     table, latest_period, prior_period = build_key_solvency_overview_table(data)
-    st.markdown("### :material/table_chart: 关键偿付数据概览")
     if table.empty:
         st.info("当前数据没有可生成关键偿付数据概览的公司记录。")
         return table
@@ -867,7 +918,12 @@ def render_key_solvency_overview(
         st.warning("当前缺少本期对应的上年同期报告期；所有同期变化列暂时留空。")
     display = _format_key_solvency_overview_display(table)
     st.markdown(
-        build_key_solvency_overview_html(display, highlight_company),
+        build_key_solvency_overview_html(
+            display,
+            highlight_company,
+            latest_period=latest_period,
+            prior_period=prior_period,
+        ),
         unsafe_allow_html=True,
     )
     st.caption(
@@ -952,6 +1008,7 @@ def render_major_financing(
         display = period_frame[
             ["公司名称", "增资/发债", "季度总变动", "增资/发债的影响"]
         ].reset_index(drop=True)
+        display = display_company_names(display, "公司名称")
         st.dataframe(
             display,
             width="stretch",

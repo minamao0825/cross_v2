@@ -73,7 +73,9 @@ class DashboardComponentTests(unittest.TestCase):
                 "POLICY_SURPLUS_CORE_T2": 2.2,
                 "POLICY_SURPLUS_ANC_T1": 1.1,
                 "POLICY_SURPLUS_ANC_T2": 1.1,
+                "POLICY_SURPLUS_CORE_TO_CORE_CAPITAL": 0.40,
                 "MARKET_RISK_TO_QUANT_CAPITAL": 0.25,
+                "LIFE_INSURANCE_RISK_TO_QUANT_CAPITAL": 0.30,
             },
             "2025Q2": {
                 "CORE_SOLVENCY_RATIO": 999.0,
@@ -95,35 +97,139 @@ class DashboardComponentTests(unittest.TestCase):
         table, latest, prior = build_key_solvency_overview_table(pd.DataFrame(rows))
         self.assertEqual((latest, prior), ("2025Q4", "2024Q4"))
         self.assertEqual(
-            table.columns[1],
-            "核心资本充足率%变化 2025Q4-2024Q4",
+            table.columns.tolist(),
+            [
+                "公司名称",
+                "核心资本充足率2025Q4",
+                "核心资本充足率2024Q4",
+                "综合资本充足率2025Q4",
+                "综合资本充足率2024Q4",
+                "实际资本2025Q4",
+                "实际资本2024Q4",
+                "保单未来盈余2025Q4",
+                "保单未来盈余2024Q4",
+                "保单未来盈余/核心资本比例 2025Q4",
+                "市场风险占比 2025Q4",
+                "保险风险占比 2025Q4",
+                "认可负债余额2025Q4",
+                "认可负债余额2024Q4",
+            ],
         )
-        self.assertEqual(
-            table.columns[2],
-            "综合资本充足率%变化 2025Q4-2024Q4",
-        )
-        self.assertAlmostEqual(table.iloc[0, 1], 10.0)
-        self.assertAlmostEqual(table.iloc[0, 3], 0.10)
-        self.assertAlmostEqual(table.iloc[0, 5], 0.10)
-        self.assertAlmostEqual(table.iloc[0, 7], 0.25)
-        self.assertTrue(pd.isna(table.iloc[0, 8]))
+        self.assertAlmostEqual(table.iloc[0, 1], 130.0)
+        self.assertAlmostEqual(table.iloc[0, 2], 120.0)
+        self.assertAlmostEqual(table.iloc[0, 5], 110.0)
+        self.assertAlmostEqual(table.iloc[0, 7], 15.4)
+        self.assertAlmostEqual(table.iloc[0, 8], 14.0)
+        self.assertAlmostEqual(table.iloc[0, 9], 0.40)
+        self.assertAlmostEqual(table.iloc[0, 10], 0.25)
+        self.assertAlmostEqual(table.iloc[0, 11], 0.30)
+        self.assertAlmostEqual(table.iloc[0, 12], 330.0)
+        self.assertAlmostEqual(table.iloc[0, 13], 300.0)
+
+    def test_key_overview_has_no_duplicate_internal_heading(self):
+        source = (ROOT / "dashboard_components.py").read_text(encoding="utf-8")
+        self.assertNotIn('st.markdown("### :material/table_chart: 关键偿付数据概览")', source)
+
+    def test_key_solvency_overview_sums_available_policy_surplus_layers(self):
+        rows = []
+        values_by_company = {
+            "仅核心一级": {
+                "POLICY_SURPLUS_CORE_T1": 337_959.0,
+            },
+            "披露三层": {
+                "POLICY_SURPLUS_CORE_T1": 263_219.16,
+                "POLICY_SURPLUS_CORE_T2": 8_163.89,
+                "POLICY_SURPLUS_ANC_T1": 354_759.48,
+            },
+        }
+        for company, policy_values in values_by_company.items():
+            for period in ("2025Q2", "2026Q2"):
+                metrics = {
+                    "CORE_SOLVENCY_RATIO": 120.0,
+                    "COMBINED_SOLVENCY_RATIO": 180.0,
+                    "ACTUAL_CAPITAL": 1_000_000.0,
+                    "RECOGNIZED_LIABILITIES": 5_000_000.0,
+                    **policy_values,
+                }
+                for code, metric_value in metrics.items():
+                    rows.append({
+                        "公司": company,
+                        "公司类型": "寿险",
+                        "报告期": period,
+                        "期间口径": "期末数",
+                        "指标编码": code,
+                        "数值": metric_value,
+                    })
+
+        table, latest, prior = build_key_solvency_overview_table(pd.DataFrame(rows))
+
+        self.assertEqual((latest, prior), ("2026Q2", "2025Q2"))
+        by_company = table.set_index("公司名称")
+        self.assertAlmostEqual(by_company.loc["仅核心一级", "保单未来盈余2026Q2"], 337_959.0)
+        self.assertAlmostEqual(by_company.loc["仅核心一级", "保单未来盈余2025Q2"], 337_959.0)
+        expected_three_layers = 263_219.16 + 8_163.89 + 354_759.48
+        self.assertAlmostEqual(by_company.loc["披露三层", "保单未来盈余2026Q2"], expected_three_layers)
+        self.assertAlmostEqual(by_company.loc["披露三层", "保单未来盈余2025Q2"], expected_three_layers)
+
+    def test_key_overview_merges_registered_legal_and_short_names_across_years(self):
+        rows = [
+            {
+                "公司": company,
+                "公司类型": "寿险",
+                "报告期": period,
+                "期间口径": "本季度末数",
+                "指标编码": code,
+                "数值": value,
+            }
+            for company, period, code, value in (
+                ("工银安盛人寿保险有限公司", "2025Q1", "CORE_SOLVENCY_RATIO", 184.0),
+                ("工银安盛", "2026Q1", "CORE_SOLVENCY_RATIO", 128.0),
+                ("工银安盛人寿保险有限公司", "2025Q1", "COMBINED_SOLVENCY_RATIO", 248.0),
+                ("工银安盛", "2026Q1", "COMBINED_SOLVENCY_RATIO", 187.0),
+            )
+        ]
+        table, latest, prior = build_key_solvency_overview_table(pd.DataFrame(rows))
+        self.assertEqual((latest, prior), ("2026Q1", "2025Q1"))
+        self.assertEqual(len(table), 1)
+        self.assertEqual(table.iloc[0]["公司名称"], "工银安盛")
+        self.assertEqual(table.iloc[0]["核心资本充足率2026Q1"], 128.0)
+        self.assertEqual(table.iloc[0]["核心资本充足率2025Q1"], 184.0)
+        self.assertEqual(calculate_industry_overview(pd.DataFrame(rows)).company_count, 1)
 
     def test_key_solvency_overview_html_matches_annual_table_style(self):
         display = pd.DataFrame([
             {
                 "公司名称": "甲人寿<script>",
-                "核心资本充足率%变化 2025Q4-2024Q4": "10.0%",
-                "市场风险占比": "未披露",
+                "核心资本充足率2025Q4": "130.0%",
+                "核心资本充足率2024Q4": "120.0%",
+                "市场风险占比 2025Q4": "未披露",
             },
             {
                 "公司名称": "乙人寿",
-                "核心资本充足率%变化 2025Q4-2024Q4": "-2.0%",
-                "市场风险占比": "12.0%",
+                "核心资本充足率2025Q4": "128.0%",
+                "核心资本充足率2024Q4": "130.0%",
+                "市场风险占比 2025Q4": "12.0%",
             },
         ])
-        result = build_key_solvency_overview_html(display)
-        self.assertIn("font-family:sans-serif;font-size:11px", result)
+        result = build_key_solvency_overview_html(
+            display,
+            latest_period="2025Q4",
+            prior_period="2024Q4",
+        )
+        self.assertIn("font-family:sans-serif;font-size:10px", result)
         self.assertIn("background-color:#00338D;color:white", result)
+        self.assertNotIn(">最新报告期</th>", result)
+        self.assertNotIn(">去年同期</th>", result)
+        self.assertIn("核心资本充足率<br>2025Q4", result)
+        self.assertIn("核心资本充足率<br>2024Q4", result)
+        self.assertNotIn("overflow-x:auto", result)
+        self.assertNotIn("min-width:1850px", result)
+        self.assertIn("<colgroup>", result)
+        self.assertIn("table-layout:fixed", result)
+        self.assertIn("@media print", result)
+        self.assertIn("min-width:0!important", result)
+        self.assertIn("white-space:normal!important", result)
+        self.assertEqual(result.count("<thead><tr"), 1)
         self.assertIn("background-color:#CDCDCD", result)
         self.assertIn("background-color:#F8F9FA", result)
         self.assertIn("white-space:nowrap;word-break:keep-all", result)
@@ -136,20 +242,30 @@ class DashboardComponentTests(unittest.TestCase):
         self.assertIn("border-right:1.5px solid #00338D", tracked)
         self.assertIn("font-weight:bold", tracked)
 
-    def test_key_solvency_overview_first_two_headers_and_values_use_percent_signs(self):
+    def test_key_solvency_overview_formats_rates_and_amounts_by_metric_type(self):
         table = pd.DataFrame([{
             "公司名称": "甲人寿",
-            "核心资本充足率%变化 2025Q4-2024Q4": 10.0,
-            "综合资本充足率%变化 2025Q4-2024Q4": -5.0,
+            "核心资本充足率2025Q4": 130.0,
+            "综合资本充足率2024Q4": 180.0,
+            "实际资本2025Q4": 110.0,
+            "保单未来盈余/核心资本比例 2025Q4": 0.40,
+            "市场风险占比 2025Q4": 0.25,
         }])
         display = _format_key_solvency_overview_display(table)
-        self.assertEqual(display.iloc[0, 1], "10.0%")
-        self.assertEqual(display.iloc[0, 2], "-5.0%")
-        result = build_key_solvency_overview_html(display)
-        self.assertIn("核心资本充足率%变化<br>2025Q4-2024Q4", result)
-        self.assertIn("综合资本充足率%变化<br>2025Q4-2024Q4", result)
-        self.assertIn(">10.0%</td>", result)
-        self.assertIn(">-5.0%</td>", result)
+        self.assertEqual(display.iloc[0, 1], "130.0%")
+        self.assertEqual(display.iloc[0, 2], "180.0%")
+        self.assertEqual(display.iloc[0, 3], "110.00")
+        self.assertEqual(display.iloc[0, 4], "40.0%")
+        self.assertEqual(display.iloc[0, 5], "25.0%")
+        result = build_key_solvency_overview_html(
+            display,
+            latest_period="2025Q4",
+            prior_period="2024Q4",
+        )
+        self.assertIn("核心资本充足率<br>2025Q4", result)
+        self.assertIn("综合资本充足率<br>2024Q4", result)
+        self.assertIn(">130.0%</td>", result)
+        self.assertIn(">110.00</td>", result)
 
     def test_profile_copy_changes_with_life_nonlife_and_annual_profiles(self):
         self.assertEqual(
